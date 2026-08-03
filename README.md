@@ -23,76 +23,84 @@
 
 ## 部署
 
-### 方式一：一键脚本（推荐，免 build）
+### 项目与镜像
+
+- GitHub：<https://github.com/zhoushu44/Mihomo-Relay-WebUI>
+- Docker Hub：`zhoushu1/mihomo-relay-webui:latest`
+- WebUI 监听：`0.0.0.0:7892`
+- mihomo 镜像：`metacubex/mihomo:latest`，由 WebUI 自动创建和管理
+- GitHub Actions：push 到 `main` 自动构建并推送；push 到 `master` 只构建检查
+
+### 方式一：直接拉取项目镜像（推荐）
+
+不需要上传源码，不需要上传 `app.py`，也不需要在服务器执行 `docker build`。
 
 ```bash
-# 1. 上传整个 mihomo-web 文件夹到服务器
-scp -r mihomo-web root@服务器IP:/root/
+docker pull zhoushu1/mihomo-relay-webui:latest
 
-# 2. SSH 登录后执行
+docker run -d \
+    --name mihomo-web \
+    --restart always \
+    --add-host host.docker.internal:host-gateway \
+    -p 7892:7892 \
+    -e UI_PASSWORD=mihomo123 \
+    -e "SECRET_KEY=$(openssl rand -hex 32)" \
+    -e MIHOMO_HOST=host.docker.internal \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v /tmp:/tmp \
+    zhoushu1/mihomo-relay-webui:latest
+```
+
+`mihomo-web` 会通过 Docker SDK 自动拉取并管理 `metacubex/mihomo:latest`，不需要单独部署 mihomo。
+
+### 更新项目镜像
+
+```bash
+docker pull zhoushu1/mihomo-relay-webui:latest
+docker restart mihomo-web
+```
+
+`/tmp:/tmp` 会保留已保存场景、账号密码、API Key 和 mihomo 配置。
+
+### 方式二：一键脚本（备用）
+
+```bash
+scp -r mihomo-web root@服务器IP:/root/
+ssh root@服务器IP
 cd /root/mihomo-web
 bash deploy.sh
 ```
 
-脚本使用 `docker pull` + `docker run`，不需要 `docker build`。
-首次启动约 30 秒（容器内自动安装依赖），之后重启秒启。
+> `deploy.sh` 是备用部署方式；生产环境优先使用 Docker Hub 项目镜像。
 
-### 方式二：手动 docker pull + run
+## 需要开放的端口
 
-```bash
-docker pull python:3.11-slim
-docker pull metacubex/mihomo:latest
+| 端口 | 协议 | 用途 | 什么时候开放 |
+|------|------|------|--------------|
+| `7890` | TCP | SOCKS5 对外代理入口 | 客户端需要使用 SOCKS5 时必须开放 |
+| `7891` | TCP | HTTP 对外代理入口 | 客户端需要使用 HTTP 代理时必须开放 |
+| `7892` | TCP | WebUI 管理页面和 API | 需要远程管理或调用 API 时必须开放 |
 
-docker rm -f mihomo-web mihomo 2>/dev/null
+常规完整使用需要在云服务商安全组和服务器防火墙中同时开放：
 
-docker run -d \
-    --name mihomo-web \
-    --restart always \
-    --add-host host.docker.internal:host-gateway \
-    -p 7892:7892 \
-    -e UI_PASSWORD=mihomo123 \
-    -e SECRET_KEY=$(openssl rand -hex 32) \
-    -e MIHOMO_HOST=host.docker.internal \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /tmp:/tmp \
-    -v /root/mihomo-web/app.py:/app/app.py:ro \
-    -w /app \
-    python:3.11-slim \
-    bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends curl cron >/dev/null 2>&1 && pip install --no-cache-dir -q flask pyyaml docker && service cron start && python app.py"
+```text
+TCP 7890
+TCP 7891
+TCP 7892
 ```
 
-### 方式三：docker build + run（启动更快）
+Ubuntu/UFW：
 
 ```bash
-docker build -t mihomo-web .
-docker run -d \
-    --name mihomo-web \
-    --restart always \
-    --add-host host.docker.internal:host-gateway \
-    -p 7892:7892 \
-    -e UI_PASSWORD=mihomo123 \
-    -e SECRET_KEY=$(openssl rand -hex 32) \
-    -e MIHOMO_HOST=host.docker.internal \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /tmp:/tmp \
-    mihomo-web
+ufw allow 7890/tcp
+ufw allow 7891/tcp
+ufw allow 7892/tcp
+ufw status
 ```
 
-### 方式四：docker-compose
+宝塔面板：进入 **安全**，分别放行 `7890`、`7891`、`7892`。
 
-```bash
-docker-compose up -d --build
-```
-
-## 端口说明
-
-| 端口 | 用途 | 是否需要放行 |
-|------|------|-------------|
-| 7890 | SOCKS5 代理 | 用代理就放行 |
-| 7891 | HTTP 代理 | 用代理就放行 |
-| 7892 | Web 管理 + API | 需要管理页面就放行 |
-
-宝塔面板：安全 -> 放行端口 7890 7891 7892
+> 安全建议：7890/7891 必须设置代理账号密码；7892 建议限制为自己的固定 IP，或通过 Nginx HTTPS 反向代理访问。mihomo 访问上游代理和订阅只需要出站网络，不需要额外开放入站端口。
 
 ## 首次使用
 
@@ -215,6 +223,10 @@ curl -X POST http://服务器IP:7892/api/rotate?key=API_KEY
 | 节点在两次检查之间挂了 | 该次请求可能失败，下次请求自动换到下一个节点 |
 | 节点恢复 | 下次健康检查通过后重新加入轮换 |
 | 订阅更新 | 每 600 秒自动重新拉取订阅 |
+
+## 已验证部署
+
+服务器已使用 `zhoushu1/mihomo-relay-webui:latest` 部署并验证：Web 登录、API 鉴权、SOCKS5/HTTP 独立认证、直连、多代理轮换、API 提取、Clash 订阅轮换、坏节点跳过、测速和浏览器折叠交互均通过。最终恢复为场景 F Clash 订阅轮换。
 
 ## 常用命令
 

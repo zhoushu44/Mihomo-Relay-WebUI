@@ -46,6 +46,7 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
+            zhoushu1/mihomo-relay-webui:2.0
             zhoushu1/mihomo-relay-webui:latest
             zhoushu1/mihomo-relay-webui:${{ github.sha }}
           cache-from: type=gha
