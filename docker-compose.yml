@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  mihomo-web:
+    build: .
+    container_name: mihomo-web
+    restart: always
+    ports:
+      - "7892:7892"
+    environment:
+      - UI_PASSWORD=mihomo123
+      - SECRET_KEY=change-this-to-a-random-string
+      - MIHOMO_HOST=host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp:/tmp
+    # mihomo 容器由 mihomo-web 通过 Docker SDK 自动创建和管理
+    # 不需要在这里定义 mihomo 服务
