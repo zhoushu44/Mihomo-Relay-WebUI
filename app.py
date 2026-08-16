@@ -1426,12 +1426,6 @@ def _sticky_maintenance_loop():
                 if now - last_health >= 60:
                     _sticky_health_check()
                     last_health = now
-                    # F 场景故障节点计数衰减（每 60s -1），故障恢复后可重新被分配
-                    with STICKY_LOCK:
-                        for k in list(STICKY_STATE['f_fail']):
-                            STICKY_STATE['f_fail'][k] = max(0, STICKY_STATE['f_fail'][k] - 1)
-                            if STICKY_STATE['f_fail'][k] == 0:
-                                del STICKY_STATE['f_fail'][k]
                 if now - last_fref >= 600:
                     _refresh_f_nodes(load_settings())
                     last_fref = now
