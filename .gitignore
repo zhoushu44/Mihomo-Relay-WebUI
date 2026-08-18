@@ -3,3 +3,11 @@ __pycache__/
 .env
 .venv/
 venv/
+
+# 测试基础设施（含服务器凭据，禁止提交）
+test_common.py
+ssh_helper.py
+
+# 测试日志与截图
+*.log
+*.png

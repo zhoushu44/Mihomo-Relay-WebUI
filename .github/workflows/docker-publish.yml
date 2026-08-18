@@ -45,9 +45,9 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          # 同一镜像同时打 1.0 和 latest 两个标签，由 Action 自动推送（本地不推送）
           tags: |
-            zhoushu1/mihomo-relay-webui:2.0
+            zhoushu1/mihomo-relay-webui:1.0
             zhoushu1/mihomo-relay-webui:latest
-            zhoushu1/mihomo-relay-webui:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

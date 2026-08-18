@@ -7,7 +7,7 @@ try:
     import docker
 except ImportError:
     docker = None
-from flask import Flask, request, render_template_string, jsonify, session, redirect, url_for
+from flask import Flask, request, render_template_string, jsonify, session, redirect, url_for, send_from_directory
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 logger = logging.getLogger('mihomo-web')
@@ -1465,9 +1465,24 @@ def render_page(**context):
     pool_in_use = sum(v['in_use'] for v in pool.values())
     sessions = [_session_public(s) for s in STICKY_STATE['sessions'].values()]
     sessions.sort(key=lambda x: x['acquired_at'])
+    # 概览页快速开始数据
+    mode_labels = {'mixed': 'SOCKS5/HTTP 混合', 'socks': 'SOCKS5', 'http': 'HTTP', 'dual': 'SOCKS5 + HTTP'}
+    settings.setdefault('entry_mode_label', mode_labels.get(settings.get('entry_mode'), settings.get('entry_mode', '')))
+    conn_urls = {}
+    for kind in ('socks', 'http'):
+        item = settings.get(kind, {})
+        scheme = 'socks5' if kind == 'socks' else 'http'
+        url = f"{scheme}://{public_host}:{item.get('port', 7890)}"
+        masked = url
+        if item.get('username'):
+            auth = f"{item['username']}:********@"
+            masked = f"{scheme}://{auth}{public_host}:{item.get('port', 7890)}"
+        conn_urls[f'{kind}_masked'] = masked
+    conn_ready = bool(settings.get('socks', {}).get('username') or settings.get('http', {}).get('username'))
     context.update(settings=settings, settings_public=settings_public, public_host=public_host,
                    sticky=sticky, pool={'total': pool_total, 'available': pool_available,
-                                        'in_use': pool_in_use}, sessions=sessions)
+                                        'in_use': pool_in_use}, sessions=sessions,
+                   api_key=settings.get('api_key', ''), conn_urls=conn_urls, conn_ready=conn_ready)
     return render_template_string(HTML, **context)
 
 
@@ -1493,8 +1508,23 @@ def login_required(fn):
     return wrapped
 
 
+@app.route('/assets/<path:filename>')
+def react_assets(filename):
+    """React 构建产物请求 /assets/...，映射到 static/assets 目录。"""
+    return send_from_directory(os.path.join(app.static_folder or 'static', 'assets'), filename)
+
+
+@app.route('/favicon.svg')
+def react_favicon():
+    return send_from_directory(app.static_folder or 'static', 'favicon.svg')
+
+
 @app.route('/')
 def index():
+    """优先托管 React 前端（前端自行处理登录态）；static/index.html 不存在时回退旧模板。"""
+    idx = os.path.join(app.static_folder or 'static', 'index.html')
+    if os.path.exists(idx):
+        return send_from_directory(app.static_folder or 'static', 'index.html')
     authed = bool(session.get('authed'))
     status = test_proxy() if authed else {'alive': False}
     if authed:
@@ -1991,7 +2021,7 @@ def api_rotate():
 def api_session_acquire():
     if not api_authorized():
         return api_auth_error()
-    data = request.get_json(silent=True) or {}
+    data = _json_body()
     task_id = data.get('task_id') or request.form.get('task_id', '')
     s, err = acquire_session(task_id)
     if s is None:
@@ -2003,7 +2033,7 @@ def api_session_acquire():
 def api_session_release():
     if not api_authorized():
         return api_auth_error()
-    data = request.get_json(silent=True) or {}
+    data = _json_body()
     task_id = data.get('task_id') or request.form.get('task_id', '')
     s, err = release_session(task_id)
     if s is None:
@@ -2075,6 +2105,620 @@ def sticky_rotate_web():
                        saved_api='', speed_result=None)
 
 
+# ==================== React 前端 JSON API 层 ====================
+def _json_body():
+    """安全解析 JSON body：非对象（字符串/数组/null）一律视为空 dict"""
+    raw = request.get_json(silent=True)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _login_required_json():
+    """API Key 全面鉴权：未配置 Key → 403（禁止管理，仅开放提取）；Key 不匹配 → 401。
+
+    支持 X-API-Key 头、?key= 参数、JSON body 的 key 字段三种传递方式。
+    """
+    settings = load_settings()
+    expected = (settings.get('api_key') or '').strip()
+    if not expected:
+        return jsonify({'ok': False, 'error': 'key_not_configured',
+                        'message': '服务未设置 API Key，管理接口已禁止访问'}), 403
+    supplied = request.headers.get('X-API-Key', '') or request.args.get('key', '') or \
+        (_json_body()).get('key', '')
+    if not secrets.compare_digest(supplied, expected):
+        return jsonify({'ok': False, 'error': 'unauthorized', 'message': 'API Key 无效'}), 401
+    return None
+
+
+def _pub_settings(settings):
+    """脱敏后的对外设置副本（密码隐藏）。"""
+    pub = json.loads(json.dumps(settings, ensure_ascii=False))
+    pub.pop('api_key', None)
+    for kind in ('socks', 'http'):
+        item = pub.get(kind, {})
+        if item.get('password'):
+            item['password'] = '********'
+    saved = pub.get('saved_scenarios', {})
+    for sc in saved.values():
+        if sc.get('password'):
+            sc['password'] = '********'
+    return pub
+
+
+def _conn_urls_for(settings, host=None):
+    host = host or request.host.split(':', 1)[0]
+    mode_labels = {'mixed': 'SOCKS5/HTTP 混合', 'socks': 'SOCKS5', 'http': 'HTTP', 'dual': 'SOCKS5 + HTTP'}
+    out = {}
+    for kind in ('socks', 'http'):
+        item = settings.get(kind, {})
+        scheme = 'socks5' if kind == 'socks' else 'http'
+        url = f"{scheme}://{host}:{item.get('port', 7890)}"
+        masked = url
+        auth = ''
+        if item.get('username'):
+            auth = f"{item['username']}:********@"
+            masked = f"{scheme}://{auth}{host}:{item.get('port', 7890)}"
+        out[kind] = {'enabled': item.get('enabled', False), 'host': host, 'port': item.get('port'),
+                     'username': item.get('username', ''), 'masked_url': masked, 'url': url}
+    return out, mode_labels.get(settings.get('entry_mode', ''), '')
+
+
+@app.route('/api/ui/login', methods=['POST'])
+def api_ui_login():
+    err = _login_required_json()
+    if err:
+        return err
+    session['authed'] = True  # 兼容旧模板页面
+    return jsonify({'ok': True, 'authed': True})
+
+
+@app.route('/api/ui/logout', methods=['POST'])
+def api_ui_logout():
+    session.pop('authed', None)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/ui/bootstrap', methods=['GET'])
+def api_ui_bootstrap():
+    err = _login_required_json()
+    if err:
+        return err
+    settings = load_settings()
+    host = request.host.split(':', 1)[0]
+    status = test_proxy()
+    status['mode'] = get_mode()
+    status['sticky_enabled'] = STICKY_STATE['enabled']
+    conn_urls, entry_mode_label = _conn_urls_for(settings, host)
+    with STICKY_LOCK:
+        sessions = [_session_public(s) for s in STICKY_STATE['sessions'].values()]
+        pool = {
+            'total': len(STICKY_STATE['pool']),
+            'available': sum(1 for v in STICKY_STATE['pool'].values() if v['available']),
+            'in_use': sum(v['in_use'] for v in STICKY_STATE['pool'].values()),
+        }
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = yaml.safe_load(f) or {}
+            for listener in cfg.get('listeners', []):
+                for user in listener.get('users', []):
+                    if user.get('password'):
+                        user['password'] = '********'
+            config_text = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+    except Exception:
+        config_text = ''
+    return jsonify({
+        'ok': True,
+        'settings': _pub_settings(settings),
+        'api_key': settings.get('api_key', ''),
+        'status': status,
+        'sticky': {
+            'enabled': STICKY_STATE['enabled'],
+            'test_url': STICKY_STATE['test_url'],
+            'test_enabled': STICKY_STATE['test_enabled'],
+            'timeout': STICKY_STATE['timeout'],
+        },
+        'pool': pool,
+        'sessions': sessions,
+        'conn_urls': conn_urls,
+        'entry_mode_label': entry_mode_label,
+        'conn_ready': bool(settings.get('socks', {}).get('username') or settings.get('http', {}).get('username')),
+        'config_text': config_text,
+        'server': host,
+    })
+
+
+@app.route('/api/ui/action', methods=['POST'])
+def api_ui_action():
+    err = _login_required_json()
+    if err:
+        return err
+    data = _json_body()
+    act = data.get('act') or request.form.get('act')
+    msg, ok = '', True
+    speed_result = None
+    if act == 'restart':
+        try:
+            get_docker_client().containers.get('mihomo').restart()
+            time.sleep(2)
+            msg = 'mihomo 已重启'
+        except Exception as e:
+            msg, ok = f'重启失败：{e}', False
+    elif act == 'refresh':
+        r = subprocess.run(['bash', REFRESH_SCRIPT], capture_output=True, text=True, timeout=30)
+        time.sleep(2)
+        msg = '代理已刷新' if r.returncode == 0 else '刷新失败（代理可能还活着）'
+        ok = r.returncode == 0
+    elif act == 'test':
+        e_err = None
+        if STICKY_STATE['enabled'] and load_settings().get('scenario') == 'E':
+            _, e_err = _ensure_e_proxy()
+        status = test_proxy()
+        if not status['alive']:
+            time.sleep(1)
+            status = test_proxy()
+        status['mode'] = get_mode()
+        if status['alive']:
+            msg = f'代理正常，出口 IP: {status["ip"]} ({status["country"]})'
+        else:
+            msg, ok = f'代理不可用{e_err or ""}', False
+        return jsonify({'ok': ok, 'message': msg, 'status': status})
+    elif act == 'speed':
+        e_err = None
+        if STICKY_STATE['enabled'] and load_settings().get('scenario') == 'E':
+            with STICKY_LOCK:
+                has_node = bool(STICKY_STATE['e_test_nodes']) or any(
+                    s.get('scenario') == 'E' and s.get('proxy_node')
+                    for s in STICKY_STATE['sessions'].values())
+            if not has_node:
+                _, e_err = _ensure_e_proxy(need_speed=True)
+        if e_err:
+            msg, ok = f'测速失败：{e_err}', False
+        else:
+            speed_result, msg = _speed_download(12)
+            ok = speed_result is not None
+            if not ok and STICKY_STATE['enabled'] and load_settings().get('scenario') == 'E':
+                with STICKY_LOCK:
+                    STICKY_STATE['e_test_nodes'] = []
+                _, e_err = _ensure_e_proxy(need_speed=True)
+                if not e_err:
+                    speed_result, msg = _speed_download(12)
+                    ok = speed_result is not None
+        return jsonify({'ok': ok, 'message': msg, 'speed': speed_result})
+    status = test_proxy()
+    status['mode'] = get_mode()
+    return jsonify({'ok': ok, 'message': msg, 'status': status})
+
+
+def _exec_apply(data):
+    """场景保存/切换核心逻辑，供 UI 与 /api/v1/config 复用。data 为合并后的字段字典。"""
+    scenario = data.get('scenario')
+    is_switch = data.get('switch') == '1'
+    settings = load_settings()
+    saved = settings.get('saved_scenarios', {})
+    msg, ok = '', False
+    if is_switch:
+        params = saved.get(scenario, {})
+        if not params and scenario != 'A':
+            msg = '没有已保存的配置，请先保存应用'
+        elif scenario == 'A':
+            params = {'configured': True}
+    else:
+        params = {}
+        if scenario == 'proxy':
+            params = {
+                'proxy_type': data.get('proxy_type', 'socks5'),
+                'proxies': (data.get('proxies') or '').strip(),
+                'username': (data.get('username') or '').strip(),
+                'password': (data.get('password') or '').strip(),
+                'rotate': data.get('rotate', 'yes'),
+            }
+        elif scenario == 'E':
+            params = {
+                'api_url': (data.get('api_url') or '').strip(),
+                'api_num': data.get('api_num', '1'),
+            }
+        elif scenario == 'F':
+            params = {
+                'clash_url': (data.get('clash_url') or '').strip(),
+                'mode': data.get('f_mode', 'direct'),
+            }
+        elif scenario == 'A':
+            params = {'configured': True}
+        saved[scenario] = params
+        settings['saved_scenarios'] = saved
+
+    if not msg:
+        if STICKY_STATE['enabled']:
+            ok, msg = True, '场景参数已保存（粘性模式已开启）'
+        elif scenario == 'A':
+            cfg = gen_direct_config()
+            ok, err = deploy_mihomo(cfg)
+            msg = '已切换到直连模式' if ok else f'失败：{err}'
+            subprocess.run('bash -c \'crontab -l 2>/dev/null | grep -v cliproxy_refresh | crontab -\'', shell=True, capture_output=True)
+        elif scenario == 'proxy':
+            ptype = params.get('proxy_type', 'socks5')
+            proxies = params.get('proxies', '').split('\n')
+            username = params.get('username', '') or None
+            password = params.get('password', '') or None
+            rotate = params.get('rotate', 'yes')
+            cfg, err = gen_proxy_config(ptype, proxies, username, password, rotate)
+            if err:
+                msg = err
+            else:
+                subprocess.run('bash -c \'crontab -l 2>/dev/null | grep -v cliproxy_refresh | crontab -\'', shell=True, capture_output=True)
+                ok, err = deploy_mihomo(cfg)
+                msg = f'已应用 {len(proxies)} 个 {ptype} 代理' + ('（轮换）' if rotate == 'yes' else '') if ok else f'失败：{err}'
+        elif scenario == 'E':
+            api_url = params.get('api_url', '').strip()
+            num = params.get('api_num', '1')
+            if not api_url:
+                msg = 'API URL 不能为空'
+            else:
+                cfg = gen_api_config(api_url, num)
+                ok, err = deploy_mihomo(cfg, scenario_e=True)
+                msg = '已切换到 API 提取模式，代理已刷新' if ok else f'失败：{err}'
+        elif scenario == 'F':
+            clash_url = params.get('clash_url', '').strip()
+            if not clash_url:
+                msg = 'Clash 订阅 URL 不能为空'
+            else:
+                try:
+                    import urllib.request, base64
+                    r = urllib.request.urlopen(clash_url, timeout=15)
+                    content = r.read().decode('utf-8', errors='replace')
+                    proxies, err = parse_clash_yaml(content)
+                    if err or not proxies:
+                        compact = ''.join(content.split())
+                        try:
+                            decoded = base64.b64decode(compact + '=' * (-len(compact) % 4)).decode('utf-8', errors='replace')
+                        except Exception:
+                            decoded = ''
+                        if any(decoded.strip().startswith(prefix) for prefix in ('vmess://', 'vless://', 'hysteria2://', 'ss://', 'trojan://')):
+                            cfg = gen_subscription_config(clash_url)
+                            subprocess.run('bash -c \'crontab -l 2>/dev/null | grep -v cliproxy_refresh | crontab -\'', shell=True, capture_output=True)
+                            ok, err = deploy_mihomo(cfg, settings=settings)
+                            msg = '已识别为 Base64/VLESS/Hysteria2 订阅，并交给 mihomo 解析应用' if ok else f'失败：{err}'
+                            proxies = []
+                        elif err:
+                            msg = f'解析失败：{err}'
+                        else:
+                            msg = '未找到 HTTP/SOCKS5 代理'
+                    if proxies:
+                        cfg, err = gen_proxy_config('http', proxies, None, None, 'yes')
+                        if err:
+                            msg = err
+                        else:
+                            subprocess.run('bash -c \'crontab -l 2>/dev/null | grep -v cliproxy_refresh | crontab -\'', shell=True, capture_output=True)
+                            ok, err = deploy_mihomo(cfg)
+                            msg = f'已解析 {len(proxies)} 个代理并应用' if ok else f'失败：{err}'
+                except Exception as e:
+                    msg = f'下载失败：{e}'
+
+    if ok:
+        settings['scenario'] = scenario
+        save_settings(settings)
+        if STICKY_STATE['enabled']:
+            _clear_sessions()
+            _sync_sticky_from_settings(settings)
+            if scenario == 'proxy':
+                _rebuild_pool_from_settings(settings)
+            elif scenario == 'F':
+                _refresh_f_nodes(settings)
+            if scenario != 'E':
+                with STICKY_LOCK:
+                    STICKY_STATE['e_test_nodes'] = []
+            ok2, err2 = _reload_sticky(settings)
+            if not ok2:
+                msg, ok = f'粘性配置应用失败：{err2}', False
+            else:
+                msg = '场景已切换（粘性模式），已重建配置'
+                if scenario == 'E':
+                    _, e_err = _ensure_e_proxy(settings)
+                    msg = '场景已切换（粘性模式），已自动提取测试节点' if not e_err else f'场景已切换，但测试节点提取失败：{e_err}'
+    time.sleep(1)
+    return {'ok': ok, 'message': msg}
+
+
+@app.route('/api/ui/apply', methods=['POST'])
+def api_ui_apply():
+    err = _login_required_json()
+    if err:
+        return err
+    data = {**request.form, **(_json_body())}
+    return jsonify(_exec_apply(data))
+
+
+def _exec_terminal(data):
+    """对外连接设置/API Key 保存核心逻辑，供 UI 与 /api/v1/config 复用。data 为合并后的字段字典。"""
+    old = load_settings()
+    new_key = (data.get('api_key') or '').strip()
+    # 仅更新 API Key：与入口配置无关，独立保存，跳过入口校验/部署
+    key_only = bool(new_key) and not any(k in data for k in (
+        'entry_mode', 'entry_port', 'entry_username', 'entry_password',
+        'socks_enabled', 'socks_port', 'socks_username', 'socks_password',
+        'http_enabled', 'http_port', 'http_username', 'http_password',
+        'exit_mode'))
+    if key_only:
+        if new_key == old.get('api_key', ''):
+            return {'ok': True, 'message': 'API Key 未变化'}
+        old['api_key'] = new_key
+        save_settings(old)
+        return {'ok': True, 'message': 'API Key 已更新'}
+    exit_mode = data.get('exit_mode') or old.get('exit_mode', 'scenario')
+    entry_mode = data.get('entry_mode') or old.get('entry_mode', 'dual')
+    settings = {
+        'scenario': old['scenario'],
+        'saved_scenarios': old.get('saved_scenarios', {}),
+        'sticky': old.get('sticky', {}),
+        'api_key': (data.get('api_key') or '').strip() or old['api_key'],
+        'entry_mode': entry_mode, 'exit_mode': exit_mode,
+    }
+    socks, http = dict(old['socks']), dict(old['http'])
+    if entry_mode in ('mixed', 'socks', 'http'):
+        # 部分更新语义：未提供的字段保留旧值
+        old_item = old['http'] if entry_mode == 'http' else old['socks']
+        port = (data.get('entry_port') or '').strip() or (old_item.get('port') or '')
+        username = (data.get('entry_username') or '').strip() or (old_item.get('username') or '')
+        password = data.get('entry_password') or old_item.get('password', '')
+        if entry_mode == 'http':
+            http.update(enabled=True, port=port, username=username, password=password)
+            socks.update(enabled=False)
+        else:
+            socks.update(enabled=True, port=port, username=username, password=password)
+            http.update(enabled=False)
+    else:
+        for kind in ('socks', 'http'):
+            entered_password = data.get(f'{kind}_password') or ''
+            item = dict(old[kind])
+            item.update(
+                enabled=data.get(f'{kind}_enabled') == 'on' if f'{kind}_enabled' in data else item['enabled'],
+                port=(data.get(f'{kind}_port') or '').strip() or item.get('port') or '',
+                username=(data.get(f'{kind}_username') or '').strip() or item.get('username', ''),
+                password=entered_password if entered_password else item['password'],
+            )
+            if not item['username']:
+                item['password'] = ''
+            (socks if kind == 'socks' else http).update(item)
+    settings['socks'], settings['http'] = socks, http
+    error = validate_terminal_settings(settings)
+    msg, ok = '', False
+    if error:
+        msg = error
+    else:
+        if STICKY_STATE['enabled']:
+            ok, deploy_error = _reload_sticky(settings)
+            if ok:
+                save_settings(settings)
+                msg = '对外连接设置已保存并应用（粘性模式）'
+            else:
+                msg = f'应用失败：{deploy_error}'
+        else:
+            if exit_mode == 'direct':
+                current = gen_direct_config()
+            else:
+                try:
+                    with open(CONFIG_PATH) as f:
+                        current = f.read()
+                except OSError:
+                    current = gen_direct_config()
+            ok, deploy_error = deploy_mihomo(current, scenario_e=settings['scenario'] == 'E', settings=settings)
+            if ok:
+                save_settings(settings)
+                msg = '对外连接设置已保存并应用'
+            else:
+                msg = f'应用失败：{deploy_error}'
+    return {'ok': ok, 'message': msg}
+
+
+@app.route('/api/ui/terminal', methods=['POST'])
+def api_ui_terminal():
+    err = _login_required_json()
+    if err:
+        return err
+    data = {**request.form, **(_json_body())}
+    return jsonify(_exec_terminal(data))
+
+
+@app.route('/api/ui/sticky-toggle', methods=['POST'])
+def api_ui_sticky_toggle():
+    err = _login_required_json()
+    if err:
+        return err
+    settings = load_settings()
+    sticky = settings.get('sticky', {})
+    sticky['enabled'] = not sticky.get('enabled', False)
+    settings['sticky'] = sticky
+    save_settings(settings)
+    _sync_sticky_from_settings(settings)
+    msg, ok = '', True
+    if sticky['enabled']:
+        subprocess.run('bash -c \'crontab -l 2>/dev/null | grep -v cliproxy_refresh | crontab -\'', shell=True, capture_output=True)
+        scenario = settings['scenario']
+        if scenario == 'proxy':
+            _rebuild_pool_from_settings(settings)
+        elif scenario == 'F':
+            _refresh_f_nodes(settings)
+        ok2, err = _reload_sticky(settings)
+        if not ok2:
+            msg, ok = f'粘性模式开启失败：{err}', False
+        else:
+            msg = '粘性会话模式已开启'
+    else:
+        _clear_sessions('关闭粘性模式')
+        if settings['scenario'] == 'E':
+            cfg = gen_api_config(settings['saved_scenarios'].get('E', {}).get('api_url', ''), '1')
+            ok, err = deploy_mihomo(cfg, scenario_e=True, settings=settings)
+        else:
+            current = gen_direct_config()
+            if settings['scenario'] == 'proxy':
+                p = settings['saved_scenarios'].get('proxy', {})
+                cfg, err = gen_proxy_config(p.get('proxy_type', 'socks5'), p.get('proxies', '').split('\n'),
+                                            p.get('username', ''), p.get('password', ''), p.get('rotate', 'yes'))
+                current = cfg
+            elif settings['scenario'] == 'F':
+                current = gen_subscription_config(settings['saved_scenarios'].get('F', {}).get('clash_url', ''))
+            ok, err = deploy_mihomo(current, settings=settings)
+        msg = '粘性会话模式已关闭，恢复原场景' if ok else f'关闭失败：{err}'
+    return jsonify({'ok': ok, 'message': msg})
+
+
+@app.route('/api/ui/sticky-settings', methods=['POST'])
+def api_ui_sticky_settings():
+    err = _login_required_json()
+    if err:
+        return err
+    data = _json_body()
+    settings = load_settings()
+    sticky = settings.get('sticky', {})
+    test_url = (data.get('test_url') or request.form.get('test_url', '')).strip()
+    if test_url:
+        sticky['test_url'] = test_url
+    try:
+        timeout = int(data.get('timeout') or request.form.get('timeout', 600))
+        if 60 <= timeout <= 86400:
+            sticky['timeout'] = timeout
+    except (TypeError, ValueError):
+        pass
+    sticky['test_enabled'] = (data.get('test_enabled', '') or request.form.get('test_enabled')) == 'on' or bool(data.get('test_enabled') is True)
+    settings['sticky'] = sticky
+    save_settings(settings)
+    _sync_sticky_from_settings(settings)
+    ok, err = _reload_sticky(settings)
+    msg = '粘性设置已保存' if ok else f'保存失败：{err}'
+    return jsonify({'ok': ok, 'message': msg})
+
+
+@app.route('/api/ui/sticky-release', methods=['POST'])
+def api_ui_sticky_release():
+    err = _login_required_json()
+    if err:
+        return err
+    data = _json_body()
+    task_id = (data.get('task_id') or request.form.get('task_id', '')).strip()
+    s, err = release_session(task_id)
+    ok = s is not None
+    return jsonify({'ok': ok, 'message': f'会话 {task_id} 已释放' if ok else f'释放失败：{err}'})
+
+
+@app.route('/api/ui/sticky-rotate', methods=['POST'])
+def api_ui_sticky_rotate():
+    err = _login_required_json()
+    if err:
+        return err
+    data = _json_body()
+    task_id = (data.get('task_id') or request.form.get('task_id', '')).strip()
+    s, err = rotate_session(task_id)
+    ok = s is not None
+    return jsonify({'ok': ok, 'message': f'会话 {task_id} 已切换' if ok else f'切换失败：{err}'})
+
+
+# 统一取代理 API（仿 Relay-Scout /api/v1/proxy 风格）：一个接口拿 IP
+# GET /api/v1/proxy?key=K&session=会话ID&consume=1&format=txt
+#   - 无 session：返回共享出口信息（socks/http URL）
+#   - 有 session：粘性会话 acquire，返回独立端口 listener（IP 独占），同 session 幂等
+#   - consume=1：释放该 session（仿消耗式提取，取走即退）
+@app.route('/api/v1/config', methods=['GET', 'POST'])
+def api_v1_config():
+    """统一配置接口（管理面）：GET 查看对外连接配置；POST 控制入口 / API Key / 场景。"""
+    err = _login_required_json()
+    if err:
+        return err
+    host = request.host.split(':', 1)[0]
+    if request.method == 'GET':
+        settings = load_settings()
+        conn, mode_label = _conn_urls_for(settings, host)
+        return jsonify({
+            'ok': True,
+            'entry_mode': settings.get('entry_mode', 'dual'),
+            'entry_mode_label': mode_label,
+            'exit_mode': settings.get('exit_mode', 'scenario'),
+            'scenario': settings.get('scenario'),
+            'connections': conn,
+            'sticky_enabled': STICKY_STATE['enabled'],
+            'conn_ready': bool(settings.get('socks', {}).get('username') or settings.get('http', {}).get('username')),
+            'server': host,
+        })
+    data = {**request.form, **(_json_body())}
+    if 'scenario' in data or 'switch' in data:
+        return jsonify(_exec_apply(data))
+    if any(k in data for k in (
+            'entry_mode', 'entry_port', 'entry_username', 'entry_password',
+            'socks_enabled', 'socks_port', 'socks_username', 'socks_password',
+            'http_enabled', 'http_port', 'http_username', 'http_password',
+            'exit_mode', 'api_key')):
+        return jsonify(_exec_terminal(data))
+    return jsonify({'ok': False, 'error': 'BAD_REQUEST',
+                    'message': '缺少可操作的配置字段，请参考 API 文档'}), 400
+
+
+@app.route('/api/v1/proxy', methods=['GET', 'POST'])
+def api_v1_proxy():
+    settings0 = load_settings()
+    supplied = request.args.get('key', '') or request.headers.get('X-API-Key', '') or \
+        (_json_body()).get('key', '')
+    expected = (settings0.get('api_key') or '').strip()
+    if expected and not secrets.compare_digest(supplied, expected):
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    host = request.host.split(':', 1)[0]
+    kwargs = _json_body()
+    fmt = request.args.get('format') or kwargs.get('format', 'json')
+    session_id = (request.args.get('session') or kwargs.get('session', '')).strip()
+    consume = request.args.get('consume') or kwargs.get('consume', '')
+    if consume == '1' or consume is True:
+        # 消耗式：释放该 session 绑定的端口（IP 交还池）
+        if not session_id:
+            return jsonify({'ok': False, 'error': 'SESSION_REQUIRED', 'message': 'consume=1 需要带 session'}), 400
+        s, err = release_session(session_id)
+        if s is None:
+            return jsonify({'ok': False, 'error': 'SESSION_NOT_FOUND', 'message': f'会话不存在或已释放：{err}'}), 404
+        data = {'ok': True, 'consumed': True, 'session': session_id}
+        return (f"ok {session_id}\n" if fmt == 'txt' else jsonify(data))
+    if session_id:
+        # 粘性会话：acquire，返回独立端口 listener
+        s, err = acquire_session(session_id)
+        if s is None:
+            if err == '粘性会话模式未开启':
+                return jsonify({'ok': False, 'error': 'STICKY_DISABLED', 'message': err}), 400
+            if err and '端口已用尽' in err:
+                return jsonify({'ok': False, 'error': 'POOL_EXHAUSTED', 'message': err}), 409
+            return jsonify({'ok': False, 'error': 'SESSION_ACQUIRE_FAILED', 'message': err}), 400
+        listener = f"{host}:{s['port']}"
+        scheme_user = ''
+        st = settings0.get('sticky', {})
+        u = st.get('username', '') or settings0.get('socks', {}).get('username', '')
+        p = st.get('password', '') or settings0.get('socks', {}).get('password', '')
+        if u:
+            scheme_user = f"{quote(u, safe='')}:{quote(p, safe='')}@"
+        url = f"socks5://{scheme_user}{host}:{s['port']}"
+        data = {'ok': True, 'session': s['task_id'], 'proxy': {'proxy': url, 'ip': host, 'port': s['port']},
+                'sticky': {'bound': True, 'expires_in': int(s['expires'] - time.time()) if s.get('expires') else None}}
+        return (f"{url}\n" if fmt == 'txt' else jsonify(data))
+    # 无 session：返回共享出口信息
+    conn, _ = _conn_urls_for(settings0, host)
+    data = {'ok': True, 'connections': conn}
+    if fmt == 'txt':
+        url = conn.get('socks', {}).get('url') or conn.get('http', {}).get('url', '')
+        return f"{url}\n"
+    return jsonify(data)
+
+
+@app.route('/api/v1/proxy/destroy', methods=['GET', 'POST'])
+def api_v1_proxy_destroy():
+    settings0 = load_settings()
+    supplied = request.args.get('key', '') or request.headers.get('X-API-Key', '') or \
+        (_json_body()).get('key', '')
+    expected = (settings0.get('api_key') or '').strip()
+    if expected and not secrets.compare_digest(supplied, expected):
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    kwargs = _json_body()
+    session_id = (request.args.get('session') or kwargs.get('session', '')).strip()
+    if not session_id:
+        return jsonify({'ok': False, 'error': 'SESSION_REQUIRED', 'message': '销毁必须带 session 参数'}), 400
+    s, err = release_session(session_id)
+    if s is None:
+        return jsonify({'ok': False, 'error': 'SESSION_NOT_FOUND', 'message': f'会话不存在或已释放：{err}'}), 404
+    return jsonify({'ok': True, 'destroyed': True, 'session': session_id})
+
+
 HTML = r'''<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -2083,77 +2727,96 @@ HTML = r'''<!DOCTYPE html>
 <title>Mihomo Relay WebUI - Mihomo 代理中转管理终端</title>
 <style>
 :root{
-  --bg:#0a0f1e;--panel:#101830;--panel2:#16203f;--line:#1f2b4d;
-  --txt:#e7ecf7;--mut:#8494b8;--dim:#5b6b8f;
-  --acc:#4d8dff;--acc2:#7a5cff;--grn:#22c98a;--red:#ff5d6c;--amb:#ffb454;--cyn:#2fd4d0;
-  --grad:linear-gradient(135deg,#4d8dff,#7a5cff);
-  --sh:0 10px 34px rgba(0,0,0,.35);
+  --bg:#f4f6fb;--panel:#ffffff;--panel2:#fbfcfe;--line:#e3e8f0;
+  --txt:#1c2739;--mut:#5b6a84;--dim:#8b96ab;
+  --acc:#2f6bff;--acc2:#4d8dff;--grn:#16a34a;--red:#dc2626;--amb:#b45309;--cyn:#0369a1;
+  --grad:linear-gradient(135deg,#2f6bff,#4d8dff);
+  --sh:0 1px 3px rgba(16,24,40,.06);
 }
 *{box-sizing:border-box}
 html,body{margin:0}
-body{font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;background:
-  radial-gradient(1200px 500px at 80% -10%,rgba(77,141,255,.14),transparent 60%),
-  radial-gradient(900px 400px at -10% 10%,rgba(122,92,255,.12),transparent 55%),
-  var(--bg);color:var(--txt);min-height:100vh;padding:0 16px 48px}
+body{font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;padding:0 16px 48px}
 .wrap{max-width:940px;margin:0 auto}
 header{display:flex;align-items:center;gap:14px;padding:26px 4px 6px;flex-wrap:wrap}
-.logo{width:42px;height:42px;border-radius:12px;background:var(--grad);display:grid;place-items:center;font-weight:800;font-size:15px;color:#fff;box-shadow:0 6px 18px rgba(77,141,255,.4);letter-spacing:.5px}
+.logo{width:42px;height:42px;border-radius:10px;background:var(--acc);display:grid;place-items:center;font-weight:800;font-size:15px;color:#fff;letter-spacing:.5px}
 header h1{font-size:19px;margin:0;font-weight:700}
 header .sub{font-size:12px;color:var(--mut);margin-top:2px}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--line);background:var(--panel);color:var(--mut)}
 .pill .dot{width:8px;height:8px;border-radius:50%;background:var(--mut)}
-.pill.on{color:var(--grn);border-color:rgba(34,201,138,.4);background:rgba(34,201,138,.08)}
-.pill.on .dot{background:var(--grn);box-shadow:0 0 10px var(--grn)}
-.pill.off{color:var(--red);border-color:rgba(255,93,108,.4);background:rgba(255,93,108,.08)}
+.pill.on{color:var(--grn);border-color:rgba(22,163,74,.35);background:rgba(22,163,74,.08)}
+.pill.on .dot{background:var(--grn)}
+.pill.off{color:var(--red);border-color:rgba(220,38,38,.35);background:rgba(220,38,38,.08)}
 .pill.off .dot{background:var(--red)}
-.card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:14px;padding:18px;margin:14px 0;box-shadow:var(--sh)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0;box-shadow:var(--sh)}
 .card h2{margin:0 0 14px;font-size:15px;font-weight:700;display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
 .card h2 .tag{display:inline-flex;align-items:center;gap:10px;min-width:0}
-.card h2 .ico{width:26px;height:26px;border-radius:8px;background:var(--grad);display:inline-grid;place-items:center;font-size:12px;font-weight:800;color:#fff;flex:none}
+.card h2 .ico{width:26px;height:26px;border-radius:7px;background:var(--acc);display:inline-grid;place-items:center;font-size:12px;font-weight:800;color:#fff;flex:none}
 .card h2 .arr{width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid var(--mut);transition:transform .25s;flex:none}
 .card.collapsed .arr{transform:rotate(-90deg)}
 .card.collapsed .content{display:none}
 .card h2 .hint{font-size:11px;color:var(--dim);font-weight:400;margin-left:auto;padding-right:8px}
 .content{margin-top:4px}
 label{display:block;font-size:12px;color:var(--mut);margin:10px 0 4px;letter-spacing:.3px}
-input,select,textarea{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:9px;background:#0c1330;color:var(--txt);font-size:13.5px;outline:none;transition:border-color .15s,box-shadow .15s}
-input:focus,select:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(77,141,255,.18)}
+input,select,textarea{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--txt);font-size:13.5px;outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(47,107,255,.12)}
 textarea{font-family:ui-monospace,Consolas,monospace;resize:vertical}
-button{padding:8px 18px;border:none;border-radius:9px;background:var(--grad);color:#fff;cursor:pointer;font-size:13.5px;font-weight:600;margin-top:10px;transition:transform .08s,filter .15s;box-shadow:0 4px 14px rgba(77,141,255,.28)}
-button:hover{filter:brightness(1.12)}
+button{padding:8px 18px;border:none;border-radius:8px;background:var(--acc);color:#fff;cursor:pointer;font-size:13.5px;font-weight:600;margin-top:10px;transition:filter .15s}
+button:hover{filter:brightness(1.08)}
 button:active{transform:translateY(1px)}
-.btn-red{background:linear-gradient(135deg,#ff5d6c,#e0465a);box-shadow:0 4px 14px rgba(255,93,108,.25)}
-.btn-blue{background:linear-gradient(135deg,#3d7bff,#4d8dff);box-shadow:0 4px 14px rgba(61,123,255,.22)}
+.btn-red{background:#dc2626}
+.btn-blue{background:#2f6bff}
 .btn-small{padding:4px 12px;font-size:12px;margin:2px;border-radius:7px}
 .row{display:flex;gap:10px;flex-wrap:wrap}.row>div,.row>form{flex:1;min-width:150px}
-.status{padding:10px 14px;border-radius:10px;margin:10px 0;font-size:13.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.status.ok{background:rgba(34,201,138,.1);border:1px solid rgba(34,201,138,.35);color:var(--grn)}
-.status.err{background:rgba(255,93,108,.1);border:1px solid rgba(255,93,108,.35);color:var(--red)}
-pre{background:#0a0f1e;border:1px solid var(--line);padding:12px;border-radius:10px;overflow:auto;font-size:12px;max-height:400px;color:#b9c7e4}
+.status{padding:10px 14px;border-radius:8px;margin:10px 0;font-size:13.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.status.ok{background:rgba(22,163,74,.08);border:1px solid rgba(22,163,74,.3);color:var(--grn)}
+.status.err{background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);color:var(--red)}
+pre{background:#f8fafc;border:1px solid var(--line);padding:12px;border-radius:8px;overflow:auto;font-size:12px;max-height:400px;color:#3b4a63}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.note{font-size:12.5px;color:var(--mut);margin:10px 0;padding:10px 14px;background:rgba(255,180,84,.06);border:1px solid rgba(255,180,84,.25);border-left:3px solid var(--amb);border-radius:8px;line-height:1.7}
+.note{font-size:12.5px;color:var(--mut);margin:10px 0;padding:10px 14px;background:rgba(180,83,9,.06);border:1px solid rgba(180,83,9,.2);border-left:3px solid var(--amb);border-radius:8px;line-height:1.7}
 .note b{color:var(--txt)}
-.note.warning{background:rgba(255,93,108,.07);border-color:rgba(255,93,108,.3);border-left-color:var(--red)}
+.note.warning{background:rgba(220,38,38,.06);border-color:rgba(220,38,38,.25);border-left-color:var(--red)}
 .terminal-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
-.terminal-card{border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0;background:rgba(12,19,48,.5)}
+.terminal-card{border:1px solid var(--line);border-radius:10px;padding:14px;min-width:0;background:var(--panel2)}
 .terminal-card h3{margin:0 0 10px;font-size:14px;display:flex;align-items:center;gap:6px}
 .inline-check{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt)}
 .inline-check input{width:auto}
 .secret-wrap{display:flex;gap:6px}.secret-wrap input{flex:1}.secret-wrap button{margin:0;padding:6px 12px}
 .mini-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.mini-actions button{margin:0;padding:6px 12px}
-.copy-value{font:12px ui-monospace,Consolas,monospace;overflow-wrap:anywhere;color:var(--cyn);background:rgba(47,212,208,.06);border:1px dashed rgba(47,212,208,.25);border-radius:6px;padding:4px 8px;display:inline-block;max-width:100%}
-.toast{display:none;position:fixed;right:20px;bottom:20px;background:#1c2747;color:#fff;padding:10px 16px;border-radius:10px;z-index:10;border:1px solid var(--line);box-shadow:var(--sh);font-size:13px}
-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;border-radius:10px;overflow:hidden}
+.copy-value{font:12px ui-monospace,Consolas,monospace;overflow-wrap:anywhere;color:var(--cyn);background:rgba(3,105,161,.06);border:1px dashed rgba(3,105,161,.3);border-radius:6px;padding:4px 8px;display:inline-block;max-width:100%}
+.tabs{display:flex;gap:6px;margin:16px 0 4px;flex-wrap:wrap}
+.tab{padding:8px 18px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--mut);cursor:pointer;font-size:13.5px;font-weight:600;margin:0;box-shadow:none}
+.tab:hover{color:var(--txt)}
+.tab.active{background:var(--acc);color:#fff;border-color:transparent}
+.steps{display:flex;flex-direction:column;gap:10px}
+.step{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)}
+.step .n{flex:none;width:26px;height:26px;border-radius:50%;background:var(--panel);border:1px solid var(--line);display:grid;place-items:center;font-size:12px;font-weight:700;color:var(--mut)}
+.step.done .n{background:var(--grn);border-color:transparent;color:#fff}
+.step.done{opacity:.8}
+.step b{color:var(--txt)}
+.step .d{font-size:12.5px;color:var(--mut);line-height:1.7}
+.qs-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
+.qs-row .copy-value{flex:1;min-width:220px}
+.port-table td:first-child{font-family:ui-monospace,Consolas,monospace;color:var(--cyn)}
+.api-card h3{margin:16px 0 6px;font-size:14px;display:flex;align-items:center;gap:8px}
+.api-card h3 .m{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;background:rgba(47,107,255,.1);color:var(--acc)}
+.api-card .path{font:12px ui-monospace,Consolas,monospace;color:var(--amb)}
+.api-card .params{font-size:12.5px;color:var(--mut);line-height:1.8}
+.api-card .params code{color:var(--cyn)}
+.cmd-row{display:flex;gap:8px;align-items:center;margin-top:8px}
+.cmd-row pre{flex:1;margin:0}
+.cmd-row button{margin:0;padding:6px 14px}
+.toast{display:none;position:fixed;right:20px;bottom:20px;background:#1f2937;color:#fff;padding:10px 16px;border-radius:8px;z-index:10;border:1px solid var(--line);box-shadow:0 8px 24px rgba(16,24,40,.18);font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;border-radius:8px;overflow:hidden}
 th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left}
-th{background:rgba(77,141,255,.08);color:var(--mut);font-weight:600;font-size:12px;letter-spacing:.4px}
-tbody tr:hover{background:rgba(77,141,255,.05)}
+th{background:rgba(47,107,255,.06);color:var(--mut);font-weight:600;font-size:12px;letter-spacing:.4px}
+tbody tr:hover{background:rgba(47,107,255,.04)}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
-.stat{background:rgba(12,19,48,.6);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.stat{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .stat .k{font-size:11.5px;color:var(--mut);letter-spacing:.5px}
 .stat .v{font-size:20px;font-weight:800;margin-top:4px}
 .stat .v.grn{color:var(--grn)}.stat .v.red{color:var(--red)}.stat .v.acc{color:var(--acc)}.stat .v.amb{color:var(--amb)}
-.cur{font-size:11px;color:var(--grn);font-weight:600;background:rgba(34,201,138,.1);border:1px solid rgba(34,201,138,.3);padding:2px 8px;border-radius:999px;margin-left:6px;white-space:nowrap}
-code{background:rgba(77,141,255,.12);color:var(--acc);padding:1px 6px;border-radius:5px;font-size:12px}
+.cur{font-size:11px;color:var(--grn);font-weight:600;background:rgba(22,163,74,.1);border:1px solid rgba(22,163,74,.3);padding:2px 8px;border-radius:999px;margin-left:6px;white-space:nowrap}
+code{background:rgba(47,107,255,.1);color:var(--acc);padding:1px 6px;border-radius:5px;font-size:12px}
 @media(max-width:720px){.terminal-grid,.grid2{grid-template-columns:1fr}.row{flex-direction:column}.row>div,.row>form{flex:auto;min-width:0}.stats{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
@@ -2183,7 +2846,14 @@ code{background:rgba(77,141,255,.12);color:var(--acc);padding:1px 6px;border-rad
 </div>
 {% else %}
 
-<div class="card">
+<nav class="tabs" id="mainTabs">
+<button type="button" class="tab active" data-tab="overview" onclick="switchTab('overview')">概览</button>
+<button type="button" class="tab" data-tab="config" onclick="switchTab('config')">连接配置</button>
+<button type="button" class="tab" data-tab="sticky" onclick="switchTab('sticky')">粘性会话</button>
+<button type="button" class="tab" data-tab="api" onclick="switchTab('api')">API 文档</button>
+</nav>
+
+<div class="card" data-tab="overview">
 <h2><span class="tag"><span class="ico">状</span>当前状态</span><span class="arr"></span></h2>
 <div class="content">
 <div class="stats">
@@ -2200,7 +2870,47 @@ code{background:rgba(77,141,255,.12);color:var(--acc);padding:1px 6px;border-rad
 </div>
 </div>
 
-<div class="card">
+<div class="card" data-tab="overview">
+<h2><span class="tag"><span class="ico">指</span>快速开始</span><span class="arr"></span></h2>
+<div class="content">
+<div class="steps">
+<div class="step {{ 'done' if settings.socks.username or settings.http.username }}">
+<span class="n">1</span>
+<div class="d"><b>设置对外入口账号密码</b> — 到「连接配置」的<code>对外连接</code>填写入口用户名/密码并保存，这是客户端连接时的认证凭据。</div>
+</div>
+<div class="step {{ 'done' if settings.scenario in ('A','proxy','E','F') }}">
+<span class="n">2</span>
+<div class="d"><b>选择场景并保存应用</b> — 按你的上游来源选一个场景（挂代理 / API 提取 / 订阅 / 直连），点「保存应用」生效。</div>
+</div>
+<div class="step {{ 'done' if conn_ready }}">
+<span class="n">3</span>
+<div class="d"><b>复制连接链接使用</b> — 用下面的链接接入，或用「API 文档」页签的接口做程序化接入。</div>
+</div>
+</div>
+<div class="qs-row">
+<p class="copy-value" id="qsSocksLink">{{ conn_urls.socks_masked }}</p>
+<button type="button" class="btn-blue btn-small" onclick="copyQSLink('socks')">复制 SOCKS5 链接</button>
+<button type="button" class="btn-blue btn-small" onclick="copyQSLink('http')">复制 HTTP 链接</button>
+</div>
+<div class="note" style="margin-top:10px">密码含特殊字符（如 <code>@</code>）已自动 URL 编码，复制后直接可用。若入口账号密码未设置，链接将不包含认证信息。</div>
+</div>
+</div>
+
+<div class="card" data-tab="overview">
+<h2><span class="tag"><span class="ico">端</span>端口速查</span><span class="arr"></span></h2>
+<div class="content">
+<table class="port-table">
+<tr><th>端口</th><th>用途</th><th>当前状态</th></tr>
+<tr><td>7890</td><td>对外入口（{{ settings.entry_mode_label }}）</td><td>{{ '已开启' if settings.socks.enabled else '未启用' }}</td></tr>
+{% if settings.entry_mode == 'dual' %}<tr><td>7891</td><td>HTTP 对外入口</td><td>{{ '已开启' if settings.http.enabled else '未启用' }}</td></tr>{% endif %}
+<tr><td>7892</td><td>WebUI 管理面板 + API 接口</td><td>固定</td></tr>
+<tr><td>40001-40999</td><td>粘性会话动态端口（{{ '已开启' if sticky.enabled else '未开启' }}）</td><td>{{ '按需分配' if sticky.enabled else '—' }}</td></tr>
+</table>
+<div class="note" style="margin-top:8px">端口需在云安全组与服务器防火墙同时放行。详见「API 文档」页签或 README。</div>
+</div>
+</div>
+
+<div class="card" data-tab="sticky">
 <h2><span class="tag"><span class="ico">S</span>粘性会话模式</span><span class="hint">端口 40001-40999</span><span class="arr"></span></h2>
 <div class="content">
 <div class="row">
@@ -2243,7 +2953,7 @@ code{background:rgba(77,141,255,.12);color:var(--acc);padding:1px 6px;border-rad
 </div>
 </div>
 
-<div class="card">
+<div class="card" data-tab="config">
 <h2><span class="tag"><span class="ico">连</span>对外连接</span><span class="arr"></span></h2>
 <div class="content">
 <form method="post" action="/terminal-settings" id="terminalForm">
@@ -2315,7 +3025,7 @@ code{background:rgba(77,141,255,.12);color:var(--acc);padding:1px 6px;border-rad
 </div>
 </div>
 
-<div class="card">
+<div class="card" data-tab="config">
 <h2><span class="tag"><span class="ico">A</span>场景 A：直连（无上游代理）</span>{% if settings.scenario == 'A' %}<span class="cur">当前</span>{% endif %}<span class="arr"></span></h2>
 <div class="content">
 <div class="note">
@@ -2333,7 +3043,7 @@ code{background:rgba(77,141,255,.12);color:var(--acc);padding:1px 6px;border-rad
 </div>
 </div>
 
-<div class="card">
+<div class="card" data-tab="config">
 <h2><span class="tag"><span class="ico">P</span>场景 B/C/D：挂代理（SOCKS5 / HTTP）</span>{% if settings.scenario == 'proxy' %}<span class="cur">当前</span>{% endif %}<span class="arr"></span></h2>
 <div class="content">
 <div class="note">
@@ -2361,7 +3071,7 @@ code{background:rgba(77,141,255,.12);color:var(--acc);padding:1px 6px;border-rad
 </div>
 </div>
 
-<div class="card">
+<div class="card" data-tab="config">
 <h2><span class="tag"><span class="ico">E</span>场景 E：API 提取（用到才提取）</span>{% if settings.scenario == 'E' %}<span class="cur">当前</span>{% endif %}<span class="arr"></span></h2>
 <div class="content">
 <div class="note warning">
@@ -2383,7 +3093,7 @@ code{background:rgba(77,141,255,.12);color:var(--acc);padding:1px 6px;border-rad
 </div>
 </div>
 
-<div class="card">
+<div class="card" data-tab="config">
 <h2><span class="tag"><span class="ico">F</span>场景 F：Clash 订阅链接</span>{% if settings.scenario == 'F' %}<span class="cur">当前</span>{% endif %}<span class="arr"></span></h2>
 <div class="content">
 <div class="note">
@@ -2412,19 +3122,99 @@ code{background:rgba(77,141,255,.12);color:var(--acc);padding:1px 6px;border-rad
 <div class="status {{ 'ok' if success else 'err' }}">{{ message }}</div>
 {% endif %}
 
+<div class="card api-card" data-tab="api">
+<h2><span class="tag"><span class="ico">API</span>API 文档</span><span class="arr"></span></h2>
+<div class="content">
+<div class="note">
+<b>认证方式</b>：所有 API 均需携带 API Key，两种方式任选：URL 参数 <code>?key=YOUR_KEY</code> 或请求头 <code>X-API-Key: YOUR_KEY</code>。
+未授权返回 <code>401</code>。下面所有示例已自动带上当前 Key，可直接复制执行。<br>
+<b>Base URL</b>：<code>http://{{ public_host }}:7892</code>
+</div>
+
+<h3><span class="m">GET</span> <span class="path">/api/connections</span> <span class="cur" style="margin-left:0">连接信息</span></h3>
+<div class="params">返回对外 SOCKS5 / HTTP 入口的地址、端口与认证状态。可用于自动获取入口链接。</div>
+<div class="cmd-row"><pre id="api-connections">curl "http://{{ public_host }}:7892/api/connections?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-connections')">复制</button></div>
+
+<h3><span class="m">GET</span> <span class="path">/api/status</span> <span class="cur" style="margin-left:0">状态</span></h3>
+<div class="params">返回代理连通性、出口 IP/地区、当前运行模式（A/Proxy/E/F）与粘性开关状态。</div>
+<div class="cmd-row"><pre id="api-status">curl "http://{{ public_host }}:7892/api/status?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-status')">复制</button></div>
+
+<h3><span class="m">GET/POST</span> <span class="path">/api/rotate</span> <span class="cur" style="margin-left:0">轮换/刷新</span></h3>
+<div class="params">场景 E：立即重新提取代理；其他场景：重启 mihomo 生效。</div>
+<div class="cmd-row"><pre id="api-rotate">curl -X POST "http://{{ public_host }}:7892/api/rotate?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-rotate')">复制</button></div>
+
+<h3><span class="m">POST</span> <span class="path">/api/session/acquire</span> <span class="cur" style="margin-left:0">申请粘性会话</span></h3>
+<div class="params">body：<code>{"task_id": "my_task"}</code>。返回独立动态端口（40001-40999）与绑定代理。同一 <code>task_id</code> 重复申请返回同一会话（幂等）。</div>
+<div class="cmd-row"><pre id="api-acquire">curl -X POST -H 'Content-Type: application/json' -d '{"task_id": "my_task"}' "http://{{ public_host }}:7892/api/session/acquire?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-acquire')">复制</button></div>
+
+<h3><span class="m">GET</span> <span class="path">/api/session/status?task_id=xxx</span> <span class="cur" style="margin-left:0">查询会话</span></h3>
+<div class="params">按 <code>task_id</code> 查询会话当前绑定（端口/代理/过期时间）。</div>
+<div class="cmd-row"><pre id="api-sstatus">curl "http://{{ public_host }}:7892/api/session/status?key={{ api_key }}&task_id=my_task"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-sstatus')">复制</button></div>
+
+<h3><span class="m">GET</span> <span class="path">/api/session/list</span> <span class="cur" style="margin-left:0">会话列表</span></h3>
+<div class="params">列出全部活跃会话（task_id / 端口 / 绑定代理 / 获取与过期时间）。</div>
+<div class="cmd-row"><pre id="api-slist">curl "http://{{ public_host }}:7892/api/session/list?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-slist')">复制</button></div>
+
+<h3><span class="m">GET</span> <span class="path">/api/pool/status</span> <span class="cur" style="margin-left:0">代理池状态</span></h3>
+<div class="params">返回代理池总数/可用/占用、活跃会话数与每个节点的健康状态。</div>
+<div class="cmd-row"><pre id="api-pool">curl "http://{{ public_host }}:7892/api/pool/status?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-pool')">复制</button></div>
+
+<h3><span class="m">POST</span> <span class="path">/api/session/release</span> <span class="cur" style="margin-left:0">释放会话</span></h3>
+<div class="params">body：<code>{"task_id": "my_task"}</code>。释放后端口回收，可被其他任务复用。</div>
+<div class="cmd-row"><pre id="api-release">curl -X POST -H 'Content-Type: application/json' -d '{"task_id": "my_task"}' "http://{{ public_host }}:7892/api/session/release?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-release')">复制</button></div>
+
+<h3 style="margin-top:22px"><span class="m">用法</span> 粘性会话完整流程</h3>
+<div class="params">申请会话 → 得到端口 → 客户端通过 <code>socks5://入口账号:入口密码@服务器IP:40001</code> 接入 → 用完释放。</div>
+<div class="cmd-row"><pre id="api-sticky-flow"># 1. 申请（记下返回的 listener_port，例如 40001）
+curl -X POST -H 'Content-Type: application/json' -d '{"task_id": "my_task"}' "http://{{ public_host }}:7892/api/session/acquire?key={{ api_key }}"
+
+# 2. 客户端使用（填入入口账号密码，密码含特殊字符需 URL 编码）
+#    socks5://sockstest:socks-pass%401@{{ public_host }}:40001
+
+# 3. 用完释放
+curl -X POST -H 'Content-Type: application/json' -d '{"task_id": "my_task"}' "http://{{ public_host }}:7892/api/session/release?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-sticky-flow')">复制</button></div>
+
+<h3 style="margin-top:22px"><span class="m">用法</span> 场景 E：1 请求 1 IP</h3>
+<div class="params">粘性开启 + 场景 E 时，每次 acquire 懒加载提取 1 个新代理并独占端口，10 分钟过期自动清理，失败不自动切换。适合每个请求需要独立 IP 的场景。</div>
+<div class="cmd-row"><pre id="api-e-flow"># 每次请求前申请新会话即可获得独立端口与 IP
+curl -X POST -H 'Content-Type: application/json' -d '{"task_id": "req_001"}' "http://{{ public_host }}:7892/api/session/acquire?key={{ api_key }}"
+
+# 通过返回的 listener_port 发请求（每个 task_id 一条独立链路）</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-e-flow')">复制</button></div>
+</div>
+</div>
+
 {% if current_config %}
-<div class="card">
+<div class="card" data-tab="config">
 <h2><span class="tag"><span class="ico">C</span>当前配置文件</span><span class="arr"></span></h2>
 <div class="content"><pre>{{ current_config }}</pre></div>
 </div>
 {% endif %}
 
 <script>
+function switchTab(name) {
+    document.querySelectorAll('#mainTabs .tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+    document.querySelectorAll('.card[data-tab]').forEach(c => {
+        c.style.display = c.dataset.tab === name ? '' : 'none';
+    });
+    window.scrollTo({top: 0});
+}
+function copyCmd(id) {
+    const el = document.getElementById(id);
+    copyText(el.textContent.trim());
+}
+function copyQSLink(kind) {
+    const item = terminalSettings[kind];
+    const user = item.username || '';
+    const password = item.password || '';
+    const auth = user && password ? encodeURIComponent(user) + ':' + encodeURIComponent(password) + '@' : '';
+    copyText((kind === 'socks' ? 'socks5' : 'http') + '://' + auth + {{ public_host|tojson }} + ':' + item.port);
+}
 document.querySelectorAll('.card h2').forEach(h2 => {
     h2.addEventListener('click', () => {
         h2.parentElement.classList.toggle('collapsed');
     });
 });
+switchTab('overview');
 const terminalSettings = {{ settings_public|tojson }};
 function toggleSecret(btn) {
     const input = btn.previousElementSibling;

@@ -2,14 +2,14 @@ version: '3.8'
 
 services:
   mihomo-web:
-    build: .
+    image: zhoushu1/mihomo-relay-webui:latest
     container_name: mihomo-web
     restart: always
     ports:
       - "7892:7892"
     environment:
       - UI_PASSWORD=zs1236547
-      - SECRET_KEY=change-this-to-a-random-string
+      - SECRET_KEY=mihomo-relay-webui-production-2026
       - MIHOMO_HOST=host.docker.internal
     extra_hosts:
       - "host.docker.internal:host-gateway"
