@@ -660,7 +660,24 @@ def _build_full_config(settings=None):
                            'proxies': [x['name'] for x in proxies], 'url': 'http://ip-api.com/json', 'interval': 60})
             base['rules'] = ['MATCH,rotate']
         else:
-            base['rules'] = ['MATCH,REJECT']
+            # 兜底：现场从 API 提取 1 个节点，绝不落盘 MATCH,REJECT 空配置（会全拒）
+            f = settings.get('saved_scenarios', {}).get('E', {})
+            api_url = f.get('api_url', '').strip()
+            fallback = None
+            if api_url:
+                for line in _extract_from_api(api_url, 1):
+                    n = _parse_proxy_line(line)
+                    if n:
+                        fallback = n
+                        break
+            if fallback:
+                fallback['name'] = 'e_fallback'
+                proxies.append(fallback)
+                groups.append({'name': 'rotate', 'type': 'load-balance', 'strategy': 'round-robin',
+                               'proxies': ['e_fallback'], 'url': 'http://ip-api.com/json', 'interval': 60})
+                base['rules'] = ['MATCH,rotate']
+            else:
+                return None, '场景E无可用节点（API 提取失败），保留现有配置'
     elif scenario == 'F':
         if not STICKY_STATE['f_nodes']:
             _refresh_f_nodes(settings)
