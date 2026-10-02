@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """mihomo 代理管理 Web UI（含商用级粘性会话）"""
-import os, json, subprocess, yaml, time, threading, secrets, logging, base64, re, urllib.parse, urllib.request, socket
+import os, json, subprocess, yaml, time, threading, secrets, logging, base64, re, ipaddress, urllib.parse, urllib.request, socket, concurrent.futures
 from functools import wraps
 from urllib.parse import quote
 try:
@@ -25,10 +25,10 @@ def _no_cache(resp):
 
 
 PASSWORD = os.environ.get('UI_PASSWORD', 'mihomo123')
-CONFIG_PATH = '/tmp/mihomo_config.yaml'
-PROVIDERS_PATH = '/tmp/mihomo_providers.yaml'
-REFRESH_SCRIPT = '/tmp/cliproxy_refresh.sh'
-SETTINGS_PATH = '/tmp/terminal_settings.json'
+CONFIG_PATH = '/opt/mihomo-relay/mihomo_config.yaml'
+PROVIDERS_PATH = '/opt/mihomo-relay/mihomo_providers.yaml'
+REFRESH_SCRIPT = '/opt/mihomo-relay/cliproxy_refresh.sh'
+SETTINGS_PATH = '/opt/mihomo-relay/terminal_settings.json'
 MIHOMO_HOST = os.environ.get('MIHOMO_HOST', 'host.docker.internal')
 dk = None
 
@@ -51,6 +51,10 @@ STICKY_STATE = {
     'f_updated': 0,
     'f_mode': 'direct',      # F 模式：direct / poll
     'f_fail': {},            # F 节点名 -> 连续失败次数
+    'f_pool': [],            # F 预置静态 listener 池：[{port, ref, server, sport}]
+    'f_pool_sig': None,      # F 池对应的节点名签名，用于判断是否需要重建
+    'f_node_ok': {},         # F 节点可用性缓存：ref -> {ok, ts}（TTL 内免重复探测）
+    'f_direct_ref': None,    # F 正常模式固化的稳定节点名（实测可用后才固化）
     'e_test_nodes': [],      # E 场景测试节点（测速/测试/切换时自动提取，避免显示空）
     'e_extract_cd': 0,       # E 测试节点提取失败冷却截止时间戳
     'e_extract_cd_err': '',  # 冷却期直接返回的失败原因
@@ -78,6 +82,7 @@ def load_settings():
         'saved_scenarios': {},
         'sticky': {'enabled': False, 'test_url': 'http://ip-api.com/json',
                    'test_enabled': True, 'timeout': 600, 'queue_timeout': 30},
+        'whitelist': [],   # 免 API Key 的来源 IP 名单：[{ip, note, region, isp, ts}]
     }
     try:
         with open(SETTINGS_PATH, encoding='utf-8') as f:
@@ -90,6 +95,7 @@ def load_settings():
         defaults['sticky'].update(saved.get('sticky', {}))
         defaults['entry_mode'] = saved.get('entry_mode', 'mixed')
         defaults['exit_mode'] = saved.get('exit_mode', 'scenario')
+        defaults['whitelist'] = saved.get('whitelist', []) if isinstance(saved.get('whitelist'), list) else []
     except (OSError, ValueError, TypeError):
         save_settings(defaults)
     return defaults
@@ -558,7 +564,18 @@ def _sticky_users(settings=None):
 def _sticky_listeners():
     users = _sticky_users()
     out = []
+    settings = load_settings()
+    # 场景 F 使用预置静态池：每个池端口固定绑定一个订阅节点，acquire/release 不再改配置
+    if settings.get('scenario') == 'F' and STICKY_STATE['enabled']:
+        for e in STICKY_STATE['f_pool']:
+            listener = {'name': f"sticky-{e['port']}", 'type': 'socks',
+                        'listen': '0.0.0.0', 'port': e['port'], 'proxy': e['ref']}
+            if users:
+                listener['users'] = users
+            out.append(listener)
     for s in STICKY_STATE['sessions'].values():
+        if s['scenario'] == 'F':
+            continue  # F 会话复用静态池 listener，不额外生成
         listener = {'name': f"sticky-{s['port']}", 'type': 'socks',
                     'listen': '0.0.0.0', 'port': s['port'], 'proxy': s['ref']}
         if users:
@@ -584,6 +601,9 @@ def _alloc_port():
     end = STICKY_STATE['port_end']
     settings = load_settings()
     used = set(STICKY_STATE['ports'].keys())
+    # F 静态池端口已被占用（池 listener 常驻），避免动态分配时冲突
+    for e in STICKY_STATE['f_pool']:
+        used.add(e['port'])
     for item in (settings['socks'], settings['http']):
         if item['enabled']:
             used.add(int(item['port']))
@@ -595,6 +615,15 @@ def _alloc_port():
 
 def _test_through_port(port, timeout=8):
     url = STICKY_STATE['test_url']
+    # 防呆：test_url 若指向内网/bridge 地址（如 172.x / 10.x / 192.168 / 127.0.0.1），
+    # 从 host 网络的 mihomo 探测必然失败，会导致所有节点被误判不可用，这里回退到默认公网探测地址
+    try:
+        _host = url.split('://', 1)[-1].split('/', 1)[0].split(':')[0]
+        if _host.startswith(('172.', '10.', '192.168.', '127.', 'localhost')):
+            logger.warning(f'test_url 指向内网地址({url})，回退为默认探测地址')
+            url = 'http://ip-api.com/json'
+    except Exception:
+        pass
     try:
         r = subprocess.run(
             ['curl', '-x', _sticky_listen_url(port), '-sS', '--connect-timeout', '5', '--max-time', str(timeout),
@@ -605,6 +634,53 @@ def _test_through_port(port, timeout=8):
         return r.returncode == 0 and r.stdout.strip().isdigit()
     except Exception:
         return False
+
+
+F_NODE_OK_TTL = 60           # 节点可用性探测结果缓存时长（秒）
+F_PREWARM_WORKERS = 8        # 预热节点缓存的并发探测数
+
+
+def _test_ref_cached(ref, port):
+    """带 TTL 缓存的节点可用性探测：缓存有效则直接返回，过期或缺失才真正实测。
+
+    同一节点的所有池端口出口一致，故按 ref 缓存即可，避免每次 acquire 都串行 curl。"""
+    now = time.time()
+    with STICKY_LOCK:
+        rec = STICKY_STATE['f_node_ok'].get(ref)
+        if rec and now - rec['ts'] < F_NODE_OK_TTL:
+            return rec['ok']
+    ok = _test_through_port(port)
+    with STICKY_LOCK:
+        STICKY_STATE['f_node_ok'][ref] = {'ok': ok, 'ts': time.time()}
+    return ok
+
+
+def _prewarm_f_node_cache():
+    """并发预热 F 节点可用性缓存：每个节点取一个池端口探测，只在缓存缺失/过期时执行。"""
+    with STICKY_LOCK:
+        pool = list(STICKY_STATE['f_pool'])
+        cache = dict(STICKY_STATE['f_node_ok'])
+    if not pool:
+        return
+    port_of = {}
+    for e in pool:
+        port_of.setdefault(e['ref'], e['port'])  # 每个节点取首个池端口
+    now = time.time()
+    todo = [(ref, p) for ref, p in port_of.items()
+            if not (cache.get(ref) and now - cache[ref]['ts'] < F_NODE_OK_TTL)]
+    if not todo:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=F_PREWARM_WORKERS) as ex:
+        futs = {ex.submit(_test_through_port, p): ref for ref, p in todo}
+        for fut in concurrent.futures.as_completed(futs):
+            ref = futs[fut]
+            try:
+                ok = fut.result()
+            except Exception:
+                ok = False
+            with STICKY_LOCK:
+                STICKY_STATE['f_node_ok'][ref] = {'ok': ok, 'ts': time.time()}
+    logger.info(f'F 节点可用性缓存预热完成：探测 {len(todo)} 个节点')
 
 
 def _rebuild_pool_from_settings(settings=None):
@@ -629,6 +705,11 @@ def _build_full_config(settings=None):
     """粘性模式完整配置（场景 proxies + 终端/粘性 listeners）"""
     settings = settings or load_settings()
     scenario = settings['scenario']
+    if scenario != 'F' and STICKY_STATE['f_pool']:
+        # 离开场景 F：清空静态池，把端口让回动态分配
+        with STICKY_LOCK:
+            STICKY_STATE['f_pool'] = []
+            STICKY_STATE['f_pool_sig'] = None
     base = {'mode': 'rule', 'allow-lan': True, 'bind-address': '*', 'log-level': 'info', 'ipv6': False}
     proxies = []
     groups = []
@@ -687,6 +768,8 @@ def _build_full_config(settings=None):
         groups.append({'name': 'rotate', 'type': 'load-balance', 'strategy': 'round-robin',
                        'proxies': [x['name'] for x in proxies], 'url': 'http://ip-api.com/json', 'interval': 60})
         base['rules'] = ['MATCH,rotate']
+        # 预置静态 listener 池：每个池端口固定绑定一个节点，acquire/release 仅改内存
+        _ensure_f_pool(settings)
     else:
         base['rules'] = ['MATCH,DIRECT']
 
@@ -1016,10 +1099,58 @@ def _refresh_f_nodes(settings=None):
                 STICKY_STATE['f_nodes'] = nodes
                 STICKY_STATE['f_updated'] = time.time()
                 STICKY_STATE['f_fail'] = {}
+                STICKY_STATE['f_node_ok'] = {}
+                STICKY_STATE['f_direct_ref'] = None
                 STICKY_STATE['rr'] = 0
             logger.info(f'订阅刷新成功，节点数: {len(nodes)}')
     except Exception as e:
         logger.warning(f'订阅刷新失败: {e}')
+
+
+F_POOL_MAX = 300
+
+
+def _ensure_f_pool(settings=None):
+    """确保 F 静态 listener 池与当前订阅节点一致。
+
+    池条目固定绑定节点（listener 常驻），acquire/release 只改内存不再触发 SIGHUP。
+    返回 True 表示池有变更（需要应用一次配置）。"""
+    with STICKY_LOCK:
+        nodes = list(STICKY_STATE['f_nodes'])
+    if not nodes:
+        return False
+    sig = tuple(f"{n['name']}|{n.get('server')}:{n.get('port')}" for n in nodes)
+    with STICKY_LOCK:
+        if STICKY_STATE['f_pool'] and STICKY_STATE['f_pool_sig'] == sig:
+            return False
+    start = STICKY_STATE['port_start']
+    end = STICKY_STATE['port_end']
+    size = min(end - start + 1, len(nodes) * 3, F_POOL_MAX)
+    pool = []
+    for i in range(size):
+        n = nodes[i % len(nodes)]
+        pool.append({'port': start + i, 'ref': n['name'],
+                     'server': n.get('server'), 'sport': n.get('port')})
+    with STICKY_LOCK:
+        STICKY_STATE['f_pool'] = pool
+        STICKY_STATE['f_pool_sig'] = sig
+        # 现有 F 会话按节点名重映射到新池端口（保持端口唯一）
+        by_ref = {}
+        for e in pool:
+            by_ref.setdefault(e['ref'], []).append(e['port'])
+        for t, s in list(STICKY_STATE['sessions'].items()):
+            if s['scenario'] != 'F':
+                continue
+            avail = by_ref.get(s['ref'])
+            STICKY_STATE['ports'].pop(s['port'], None)
+            if not avail:
+                STICKY_STATE['sessions'].pop(t, None)
+                continue
+            new_port = avail.pop(0)
+            s['port'] = new_port
+            STICKY_STATE['ports'][new_port] = t
+    logger.info(f'F 静态池重建：节点 {len(nodes)} 个，池端口 {size} 个')
+    return True
 
 
 # ==================== 会话管理 ====================
@@ -1236,90 +1367,120 @@ def _free_port(port):
         STICKY_STATE['ports'].pop(port, None)
 
 
-def _f_available_nodes():
+F_DIRECT_MAX_FAIL = 2  # 正常模式固化节点累计失败达到此值即换节点
+
+
+def _f_direct_order(pool, fails):
+    """正常模式候选顺序：把「固化的稳定节点」排最前，失效则重选一个实测可用的节点。
+
+    与旧逻辑的区别：不再盲取节点列表里第一个“还没坏透”的，而是用带缓存的探测
+    实测确认节点当前可用后才固化；固化节点累计失败后自动换一个，避免所有任务
+    绑在一个抖动节点上一起掉线。"""
+    port_of = {}
+    for e in pool:
+        port_of.setdefault(e['ref'], e['port'])  # 每个节点取首个池端口用于探测
     with STICKY_LOCK:
-        nodes = list(STICKY_STATE['f_nodes'])
-        f_fail = dict(STICKY_STATE['f_fail'])
-    return [n for n in nodes if f_fail.get(n['name'], 0) < 3]
+        cur = STICKY_STATE.get('f_direct_ref')
+    if not cur or cur not in port_of or fails.get(cur, 0) >= F_DIRECT_MAX_FAIL:
+        cur = None
+        for n in STICKY_STATE['f_nodes']:  # 按订阅顺序找第一个实测可用的节点
+            ref = n['name']
+            if fails.get(ref, 0) >= F_DIRECT_MAX_FAIL or ref not in port_of:
+                continue
+            if _test_ref_cached(ref, port_of[ref]):
+                cur = ref
+                break
+        with STICKY_LOCK:
+            STICKY_STATE['f_direct_ref'] = cur
+    if not cur:
+        return list(pool)
+    return ([e for e in pool if e['ref'] == cur]      # 固定节点的多个池端口先行
+            + [e for e in pool if e['ref'] != cur])   # 兜底：其它节点
 
 
 def _acquire_f(task_id):
-    """场景 F：直连（绑定第一个可用，不过期，故障切换）/ 轮询（10分钟过期）"""
+    """场景 F：注册模式（poll，每任务不同 IP，10分钟过期）/ 正常模式（direct，固定一个可用 IP，不过期）。
+
+    使用预置静态 listener 池：acquire 只挑选空闲池端口并写内存，池 listener 已常驻，
+    因此不再触发 SIGHUP 全量重载（旧实现每次分配都重载，批量时会重载风暴+级联超时）。"""
     settings = load_settings()
     if not STICKY_STATE['f_nodes']:
         _refresh_f_nodes(settings)
     if not STICKY_STATE['f_nodes']:
         return None, '订阅节点为空'
-    mode = STICKY_STATE['f_mode']
-    attempts = 0
-    while True:
-        nodes = _f_available_nodes()
-        if not nodes:
-            if mode == 'poll' and STICKY_STATE['f_nodes']:
-                nodes = [STICKY_STATE['f_nodes'][0]]
-            if not nodes:
-                return None, '所有节点均不可用'
-        idx = STICKY_STATE['rr'] % len(nodes)
-        with STICKY_LOCK:
-            STICKY_STATE['rr'] += 1
-        node = nodes[idx]
-        ref = node['name']
-        port = _alloc_port()
-        if port is None:
-            return None, '端口已用尽'
-        session = {'task_id': task_id, 'proxy': f"{node.get('server')}:{node.get('port')}",
-                   'proxy_key': None, 'ref': ref, 'port': port, 'scenario': 'F',
-                   'created': time.time(),
-                   'expires': time.time() + STICKY_STATE['timeout'] if mode == 'poll' else None,
-                   'failures': 0, 'status': 'active', 'proxy_node': None}
-        _store_session(session)
-        attempts += 1
+    if _ensure_f_pool(settings):
         ok, err = _reload_sticky(settings)
         if not ok:
-            release_session(task_id)
             return None, f'热重载失败：{err}'
-        if STICKY_STATE['test_enabled']:
-            if _test_through_port(port):
-                logger.info(f'F 分配成功 task_id={task_id} node={ref} port={port} mode={mode}')
-                return session, None
-            if mode == 'direct':
-                with STICKY_LOCK:
-                    STICKY_STATE['f_fail'][ref] = STICKY_STATE['f_fail'].get(ref, 0) + 1
-                logger.warning(f'F 直连节点 {ref} 不可用，失败计数+1 task_id={task_id}')
-                release_session(task_id)
-                if attempts >= len(STICKY_STATE['f_nodes']):
-                    return None, '遍历所有节点均不可用'
-                continue
-            # 轮询模式：测试失败则计数+1并跳过，试下一个；全部失败则复用
-            with STICKY_LOCK:
-                STICKY_STATE['f_fail'][ref] = STICKY_STATE['f_fail'].get(ref, 0) + 1
-            release_session(task_id)
-            if attempts >= len(STICKY_STATE['f_nodes']):
-                return _acquire_f_reuse(task_id)
-            continue
-        logger.info(f'F 分配成功（未验证）task_id={task_id} node={ref} port={port}')
-        return session, None
-
-
-def _acquire_f_reuse(task_id):
-    """F 轮询：节点不够时复用已分配节点"""
+    mode = STICKY_STATE['f_mode']
     with STICKY_LOCK:
-        if not STICKY_STATE['f_nodes']:
-            return None, '订阅节点为空'
-        node = STICKY_STATE['f_nodes'][0]
-    port = _alloc_port()
-    if port is None:
-        return None, '端口已用尽'
-    session = {'task_id': task_id, 'proxy': f"{node.get('server')}:{node.get('port')}",
-               'proxy_key': None, 'ref': node['name'], 'port': port, 'scenario': 'F',
-               'created': time.time(), 'expires': time.time() + STICKY_STATE['timeout'],
+        pool = list(STICKY_STATE['f_pool'])
+        fails = dict(STICKY_STATE['f_fail'])
+        # busy 以 ports 为准（含在途占位），而非 sessions，避免并发下选到同一端口
+        pool_ports = {e['port'] for e in pool}
+        busy = {p for p in STICKY_STATE['ports'] if p in pool_ports}
+    if not pool:
+        return None, 'F 静态池为空'
+    if mode == 'direct':
+        # 正常模式：固定一个「实测可用」的稳定节点，保证多次分配拿到同一出口 IP
+        ordered = _f_direct_order(pool, fails)
+    else:
+        # 注册模式：锁内取号并自增 rr，避免并发读到同一索引而互相撞探测
+        n = len(pool)
+        with STICKY_LOCK:
+            idx = STICKY_STATE['rr'] % n
+            STICKY_STATE['rr'] = idx + 1
+        ordered = [pool[(idx + i) % n] for i in range(n)]
+
+    def _try_acquire(e):
+        """锁内原子占位端口，出锁后用（带 TTLCache 的）探测判断可用性。成功返回 session，失败返回 None。"""
+        port = e['port']
+        with STICKY_LOCK:
+            if port in STICKY_STATE['ports']:
+                return None  # 已被其他并发请求占用
+            STICKY_STATE['ports'][port] = task_id  # 占位（非原子写会导致端口重复）
+        if _test_ref_cached(e['ref'], port):
+            session = {'task_id': task_id, 'proxy': f"{e['server']}:{e['sport']}",
+                       'proxy_key': None, 'ref': e['ref'], 'port': port, 'scenario': 'F',
+                       'created': time.time(),
+                       'expires': time.time() + STICKY_STATE['timeout'] if mode == 'poll' else None,
+                       'failures': 0, 'status': 'active', 'proxy_node': None}
+            _store_session(session)
+            return session
+        # 实测不可用：撤销占位并累计节点失败计数
+        with STICKY_LOCK:
+            STICKY_STATE['ports'].pop(port, None)
+            STICKY_STATE['f_fail'][e['ref']] = STICKY_STATE['f_fail'].get(e['ref'], 0) + 1
+        logger.warning(f'F 节点 {e["ref"]} 不可用，失败计数+1 task_id={task_id}')
+        return None
+
+    tried = 0
+    for e in ordered:
+        if tried >= 30:  # 单次最多实测 30 个候选，避免客户端侧长时间等待
+            break
+        if e['port'] in busy:  # 快照即已占用，跳过（仅优化，真正互斥靠锁内占位）
+            continue
+        if fails.get(e['ref'], 0) >= 3:
+            continue
+        tried += 1
+        session = _try_acquire(e)
+        if session:
+            logger.info(f'F 分配成功 task_id={task_id} node={e["ref"]} port={e["port"]} mode={mode}')
+            return session, None
+    # 候选全部不可用/被占：兜底原子挑选任一空闲池端口（不做可用性校验，保持旧语义）
+    with STICKY_LOCK:
+        cand = next((e for e in pool if e['port'] not in STICKY_STATE['ports']), None)
+        if cand:
+            STICKY_STATE['ports'][cand['port']] = task_id
+    if not cand:
+        return None, '节点已全部占用，请稍后重试或释放部分任务'
+    session = {'task_id': task_id, 'proxy': f"{cand['server']}:{cand['sport']}",
+               'proxy_key': None, 'ref': cand['ref'], 'port': cand['port'], 'scenario': 'F',
+               'created': time.time(),
+               'expires': time.time() + STICKY_STATE['timeout'] if mode == 'poll' else None,
                'failures': 0, 'status': 'active', 'proxy_node': None}
     _store_session(session)
-    ok, err = _reload_sticky(load_settings())
-    if not ok:
-        release_session(task_id)
-        return None, f'热重载失败：{err}'
-    logger.info(f'F 轮询复用节点 task_id={task_id} node={node["name"]} port={port}')
+    logger.info(f'F 兜底复用 task_id={task_id} node={cand["ref"]} port={cand["port"]} mode={mode}')
     return session, None
 
 
@@ -1332,6 +1493,11 @@ def release_session(task_id):
         info = STICKY_STATE['pool'].get(s.get('proxy_key'))
         if info:
             info['in_use'] = max(0, info['in_use'] - 1)
+        is_f = s['scenario'] == 'F'
+    if is_f:
+        # F 使用常驻静态池：释放只改内存，无需热重载
+        logger.info(f'release task_id={task_id} port={s["port"]} node={s.get("ref")} (static pool)')
+        return s, None
     settings = load_settings()
     ok, err = _reload_sticky(settings)
     logger.info(f'release task_id={task_id} port={s["port"]} proxy={s.get("proxy")} ok={ok}')
@@ -1371,25 +1537,34 @@ def rotate_session(task_id):
         if STICKY_STATE['test_enabled'] and not _test_through_port(s['port']):
             return s, '已切换但新代理测试失败'
         return s, None
-    if scenario == 'F' and STICKY_STATE['f_mode'] == 'direct':
-        nodes = _f_available_nodes()
-        candidates = [n for n in nodes if n['name'] != old_ref]
-        if not candidates:
+    if scenario == 'F':
+        with STICKY_LOCK:
+            fp = list(STICKY_STATE['f_pool'])
+            busy = {x['port'] for x in STICKY_STATE['sessions'].values()
+                    if x['scenario'] == 'F' and x['task_id'] != task_id}
+            cur_port = s['port']
+        if not fp:
+            return None, 'F 静态池为空'
+        # 优先换到不同出口节点，同节点下的其他空闲池端口作为备选
+        cands = sorted((e for e in fp if e['port'] not in busy and e['port'] != cur_port),
+                       key=lambda e: 0 if e['ref'] != old_ref else 1)
+        if not cands:
             return None, '没有其他可用节点'
-        for node in candidates:
-            with STICKY_LOCK:
-                s['ref'] = node['name']
-                s['proxy'] = f"{node.get('server')}:{node.get('port')}"
-            ok, err = _reload_sticky()
-            if not ok:
-                return None, f'热重载失败：{err}'
-            if STICKY_STATE['test_enabled']:
-                if _test_through_port(s['port']):
-                    return s, None
+        for e in cands:
+            if _test_through_port(e['port']):
                 with STICKY_LOCK:
-                    STICKY_STATE['f_fail'][node['name']] = STICKY_STATE['f_fail'].get(node['name'], 0) + 1
-                continue
-            return s, None
+                    STICKY_STATE['ports'].pop(cur_port, None)
+                    s['ref'] = e['ref']
+                    s['proxy'] = f"{e['server']}:{e['sport']}"
+                    s['port'] = e['port']
+                    STICKY_STATE['ports'][e['port']] = task_id
+                    # 正常模式：同步固化的稳定节点，保证后续 acquire 拿到同一新出口 IP
+                    if STICKY_STATE['f_mode'] == 'direct':
+                        STICKY_STATE['f_direct_ref'] = e['ref']
+                logger.info(f'F 会话切换 task_id={task_id} node={e["ref"]} port={e["port"]}')
+                return s, None
+            with STICKY_LOCK:
+                STICKY_STATE['f_fail'][e['ref']] = STICKY_STATE['f_fail'].get(e['ref'], 0) + 1
         return None, '所有候选节点均不可用'
     return None, '该场景会话不支持手动切换'
 
@@ -1434,12 +1609,26 @@ def _sticky_health_check():
 def _sticky_maintenance_loop():
     last_health = 0
     last_fref = 0
+    last_prewarm = 0
     while True:
         try:
-            _sync_sticky_from_settings()
+            settings = load_settings()
+            _sync_sticky_from_settings(settings)
             _sticky_cleanup()
             now = time.time()
             if STICKY_STATE['enabled']:
+                if settings.get('scenario') == 'F':
+                    # 冷启动预热：池为空时主动建池并应用一次，避免首个用户等待数秒
+                    if not STICKY_STATE['f_pool']:
+                        if not STICKY_STATE['f_nodes']:
+                            _refresh_f_nodes(settings)
+                        if _ensure_f_pool(settings):
+                            ok, err = _reload_sticky(settings)
+                            logger.info('F 静态池预热完成' if ok else f'F 静态池预热热重载失败：{err}')
+                    # 节点可用性缓存预热：让 acquire 走缓存快路径（亚秒级）
+                    elif now - last_prewarm >= 60:
+                        _prewarm_f_node_cache()
+                        last_prewarm = now
                 if now - last_health >= 60:
                     _sticky_health_check()
                     last_health = now
@@ -1499,7 +1688,8 @@ def render_page(**context):
     context.update(settings=settings, settings_public=settings_public, public_host=public_host,
                    sticky=sticky, pool={'total': pool_total, 'available': pool_available,
                                         'in_use': pool_in_use}, sessions=sessions,
-                   api_key=settings.get('api_key', ''), conn_urls=conn_urls, conn_ready=conn_ready)
+                   api_key=settings.get('api_key', ''), conn_urls=conn_urls, conn_ready=conn_ready,
+                   whitelist=_whitelist_public(), client_ip=_client_ip())
     return render_template_string(HTML, **context)
 
 
@@ -1564,6 +1754,12 @@ def login():
         return redirect(url_for('index'))
     return render_page(authed=False, status={'alive': False}, current_config='', message='密码错误',
                        success=False, saved_api='', speed_result=None)
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('index'))
 
 
 @app.route('/apply', methods=['POST'])
@@ -1805,6 +2001,7 @@ def terminal_settings():
         'sticky': old.get('sticky', {}),
         'api_key': request.form.get('api_key', '').strip() or old['api_key'],
         'entry_mode': entry_mode, 'exit_mode': exit_mode,
+        'whitelist': old.get('whitelist', []),
     }
     socks, http = dict(old['socks']), dict(old['http'])
     if entry_mode in ('mixed', 'socks', 'http'):
@@ -1977,15 +2174,101 @@ def sticky_release():
                        saved_api='', speed_result=None)
 
 
+# ==================== 来源 IP 白名单 ====================
+_ALWAYS_ALLOW_IP = {'127.0.0.1', '::1', '::ffff:127.0.0.1'}
+
+
+def _client_ip():
+    """获取请求来源 IP：优先 X-Forwarded-For 首个地址，否则 remote_addr。"""
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        first = fwd.split(',')[0].strip()
+        if first:
+            return first
+    return request.remote_addr or ''
+
+
+def _norm_ip_entry(raw):
+    """校验并规范化单个 IP / CIDR；非法返回 None。"""
+    raw = (raw or '').strip()
+    if not raw:
+        return None
+    try:
+        if '/' in raw:
+            return str(ipaddress.ip_network(raw, strict=False))
+        return str(ipaddress.ip_address(raw))
+    except ValueError:
+        return None
+
+
+def _ip_matches(entry, ip):
+    """判断 ip 是否命中白名单条目（支持单 IP 与 CIDR）。"""
+    entry = (entry or '').strip()
+    if not entry:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+        if '/' in entry:
+            return addr in ipaddress.ip_network(entry, strict=False)
+        return addr == ipaddress.ip_address(entry)
+    except ValueError:
+        return False
+
+
+def _is_whitelisted(ip=None):
+    """来源 IP 是否在白名单内；本机回环地址始终放行。"""
+    ip = (ip or _client_ip()).strip()
+    if not ip:
+        return False
+    if ip in _ALWAYS_ALLOW_IP:
+        return True
+    if ip.startswith('::ffff:'):  # IPv4-mapped IPv6
+        ip = ip[7:]
+    for e in load_settings().get('whitelist', []):
+        if _ip_matches(e.get('ip'), ip):
+            return True
+    return False
+
+
+def _lookup_ip_region(ip):
+    """查询 IP 归属地（国家/省/市）与 ISP，失败返回空串。"""
+    try:
+        url = 'http://ip-api.com/json/' + quote(ip) + '?lang=zh-CN&fields=status,country,regionName,city,isp'
+        r = subprocess.run(['curl', '-sS', '--max-time', '6', url], capture_output=True, text=True, timeout=8)
+        d = json.loads(r.stdout)
+        if d.get('status') == 'success':
+            region = ' '.join(x for x in (d.get('country'), d.get('regionName'), d.get('city')) if x)
+            return region, d.get('isp', '')
+    except Exception:
+        pass
+    return '', ''
+
+
+def _whitelist_public():
+    """白名单展示副本（补一个可读时间字符串）。"""
+    out = []
+    for e in sorted(load_settings().get('whitelist', []), key=lambda x: x.get('ts', 0)):
+        ts = e.get('ts', 0)
+        out.append({
+            'ip': e.get('ip', ''), 'note': e.get('note', ''),
+            'region': e.get('region', ''), 'isp': e.get('isp', ''),
+            'ts': ts,
+            'ts_str': time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)) if ts else '—',
+        })
+    return out
+
+
 # ==================== API 认证与接口 ====================
 def api_authorized():
+    if _is_whitelisted():
+        return True
     settings = load_settings()
     supplied = request.args.get('key', '') or request.headers.get('X-API-Key', '')
     return bool(supplied) and secrets.compare_digest(supplied, settings['api_key'])
 
 
 def api_auth_error():
-    return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    return jsonify({'ok': False, 'error': 'unauthorized', 'message': '缺少或无效的 API Key；如来源 IP 已加入白名单则无需 Key'}), 401
 
 
 @app.route('/api/connections')
@@ -2104,6 +2387,48 @@ def api_pool_status():
     }})
 
 
+@app.route('/api/whitelist', methods=['GET', 'POST', 'DELETE'])
+def api_whitelist():
+    """白名单管理：面板已登录 / API Key 有效 / 来源已在白名单，三者任一即可操作。"""
+    if not (session.get('authed') or api_authorized()):
+        return api_auth_error()
+    settings = load_settings()
+    wl = settings.setdefault('whitelist', [])
+    if request.method == 'GET':
+        return jsonify({'ok': True, 'client_ip': _client_ip(), 'entries': _whitelist_public(),
+                        'total': len(wl), 'whitelisted': _is_whitelisted()})
+    data = {**request.args.to_dict(), **(_json_body())}
+    if request.method == 'POST':
+        norm = _norm_ip_entry(data.get('ip'))
+        if not norm:
+            return jsonify({'ok': False, 'error': 'invalid_ip', 'message': 'IP / CIDR 格式不正确'}), 400
+        if any(e.get('ip') == norm for e in wl):
+            return jsonify({'ok': False, 'error': 'duplicate', 'message': '该 IP 已在白名单中'}), 409
+        region, isp = ('', '')
+        if '/' not in norm:
+            region, isp = _lookup_ip_region(norm)
+        entry = {'ip': norm, 'note': (data.get('note') or '').strip(),
+                 'region': region, 'isp': isp, 'ts': int(time.time())}
+        wl.append(entry)
+        save_settings(settings)
+        return jsonify({'ok': True, 'message': f'已添加 {norm}', 'entry': entry})
+    # DELETE：支持 ip 单个 或 ips 批量
+    ips = data.get('ips') or []
+    if isinstance(ips, str):
+        ips = [x for x in ips.split(',') if x.strip()]
+    single = (data.get('ip') or '').strip()
+    if single:
+        ips.append(single)
+    targets = {t for t in (_norm_ip_entry(x) for x in ips) if t}
+    if not targets:
+        return jsonify({'ok': False, 'error': 'no_target', 'message': '未指定要删除的 IP'}), 400
+    before = len(wl)
+    settings['whitelist'] = [e for e in wl if e.get('ip') not in targets]
+    removed = before - len(settings['whitelist'])
+    save_settings(settings)
+    return jsonify({'ok': True, 'message': f'已删除 {removed} 条', 'removed': removed})
+
+
 @app.route('/sticky-rotate', methods=['POST'])
 @login_required
 def sticky_rotate_web():
@@ -2134,13 +2459,16 @@ def _login_required_json():
 
     支持 X-API-Key 头、?key= 参数、JSON body 的 key 字段三种传递方式。
     """
+    if _is_whitelisted():  # 白名单来源 IP 免 Key
+        return None
     settings = load_settings()
     expected = (settings.get('api_key') or '').strip()
     if not expected:
         return jsonify({'ok': False, 'error': 'key_not_configured',
                         'message': '服务未设置 API Key，管理接口已禁止访问'}), 403
+    _body = _json_body()
     supplied = request.headers.get('X-API-Key', '') or request.args.get('key', '') or \
-        (_json_body()).get('key', '')
+        _body.get('key', '') or _body.get('api_key', '')
     if not secrets.compare_digest(supplied, expected):
         return jsonify({'ok': False, 'error': 'unauthorized', 'message': 'API Key 无效'}), 401
     return None
@@ -2312,34 +2640,43 @@ def _exec_apply(data):
     settings = load_settings()
     saved = settings.get('saved_scenarios', {})
     msg, ok = '', False
+    # 从请求体构造本场景参数（每次调用都解析，便于 switch 时覆盖已保存配置）
+    req_params = {}
+    if scenario == 'proxy':
+        req_params = {
+            'proxy_type': data.get('proxy_type', 'socks5'),
+            'proxies': (data.get('proxies') or '').strip(),
+            'username': (data.get('username') or '').strip(),
+            'password': (data.get('password') or '').strip(),
+            'rotate': data.get('rotate', 'yes'),
+        }
+    elif scenario == 'E':
+        req_params = {
+            'api_url': (data.get('api_url') or '').strip(),
+            'api_num': data.get('api_num', '1'),
+        }
+    elif scenario == 'F':
+        req_params = {
+            'clash_url': (data.get('clash_url') or '').strip(),
+            'mode': data.get('f_mode', 'direct'),
+        }
     if is_switch:
-        params = saved.get(scenario, {})
+        params = dict(saved.get(scenario, {}))
+        # 请求体携带了有效参数时覆盖已保存配置（API 单次调用即可保存+切换）
+        if req_params:
+            has_value = any(v for k, v in req_params.items()
+                            if k not in ('mode', 'proxy_type', 'rotate', 'api_num'))
+            if has_value or not params:
+                params.update({k: v for k, v in req_params.items() if v != ''})
         if not params and scenario != 'A':
             msg = '没有已保存的配置，请先保存应用'
         elif scenario == 'A':
             params = {'configured': True}
     else:
-        params = {}
-        if scenario == 'proxy':
-            params = {
-                'proxy_type': data.get('proxy_type', 'socks5'),
-                'proxies': (data.get('proxies') or '').strip(),
-                'username': (data.get('username') or '').strip(),
-                'password': (data.get('password') or '').strip(),
-                'rotate': data.get('rotate', 'yes'),
-            }
-        elif scenario == 'E':
-            params = {
-                'api_url': (data.get('api_url') or '').strip(),
-                'api_num': data.get('api_num', '1'),
-            }
-        elif scenario == 'F':
-            params = {
-                'clash_url': (data.get('clash_url') or '').strip(),
-                'mode': data.get('f_mode', 'direct'),
-            }
-        elif scenario == 'A':
+        params = req_params
+        if scenario == 'A':
             params = {'configured': True}
+    if params:
         saved[scenario] = params
         settings['saved_scenarios'] = saved
 
@@ -2447,6 +2784,13 @@ def api_ui_apply():
 def _exec_terminal(data):
     """对外连接设置/API Key 保存核心逻辑，供 UI 与 /api/v1/config 复用。data 为合并后的字段字典。"""
     old = load_settings()
+    # JSON 调用可能传数字/布尔，统一做字符串归一化，避免 .strip() 抛错
+    for _k in ('api_key', 'entry_mode', 'entry_port', 'entry_username', 'entry_password',
+               'socks_port', 'socks_username', 'socks_password',
+               'http_port', 'http_username', 'http_password',
+               'exit_mode', 'scenario', 'switch'):
+        if _k in data and data[_k] is not None:
+            data[_k] = str(data[_k])
     new_key = (data.get('api_key') or '').strip()
     # 仅更新 API Key：与入口配置无关，独立保存，跳过入口校验/部署
     key_only = bool(new_key) and not any(k in data for k in (
@@ -2468,6 +2812,7 @@ def _exec_terminal(data):
         'sticky': old.get('sticky', {}),
         'api_key': (data.get('api_key') or '').strip() or old['api_key'],
         'entry_mode': entry_mode, 'exit_mode': exit_mode,
+        'whitelist': old.get('whitelist', []),
     }
     socks, http = dict(old['socks']), dict(old['http'])
     if entry_mode in ('mixed', 'socks', 'http'):
@@ -2486,8 +2831,10 @@ def _exec_terminal(data):
         for kind in ('socks', 'http'):
             entered_password = data.get(f'{kind}_password') or ''
             item = dict(old[kind])
+            def _truthy(v):
+                return str(v).strip().lower() in ('on', 'true', '1', 'yes')
             item.update(
-                enabled=data.get(f'{kind}_enabled') == 'on' if f'{kind}_enabled' in data else item['enabled'],
+                enabled=_truthy(data.get(f'{kind}_enabled')) if f'{kind}_enabled' in data else item['enabled'],
                 port=(data.get(f'{kind}_port') or '').strip() or item.get('port') or '',
                 username=(data.get(f'{kind}_username') or '').strip() or item.get('username', ''),
                 password=entered_password if entered_password else item['password'],
@@ -2655,13 +3002,24 @@ def api_v1_config():
             'server': host,
         })
     data = {**request.form, **(_json_body())}
-    if 'scenario' in data or 'switch' in data:
+    entry_keys = (
+        'entry_mode', 'entry_port', 'entry_username', 'entry_password',
+        'socks_enabled', 'socks_port', 'socks_username', 'socks_password',
+        'http_enabled', 'http_port', 'http_username', 'http_password')
+    has_entry = any(k in data for k in entry_keys) or 'exit_mode' in data
+    has_scenario = 'scenario' in data or 'switch' in data
+    if has_entry:
+        # 入口/出口配置优先处理：入口变更会重建监听与配置
+        result = _exec_terminal(data)
+        if not result.get('ok'):
+            return jsonify(result)
+        if has_scenario:
+            # 同时携带场景参数：入口已生效，继续切换场景
+            return jsonify(_exec_apply(data))
+        return jsonify(result)
+    if has_scenario:
         return jsonify(_exec_apply(data))
-    if any(k in data for k in (
-            'entry_mode', 'entry_port', 'entry_username', 'entry_password',
-            'socks_enabled', 'socks_port', 'socks_username', 'socks_password',
-            'http_enabled', 'http_port', 'http_username', 'http_password',
-            'exit_mode', 'api_key')):
+    if 'api_key' in data:
         return jsonify(_exec_terminal(data))
     return jsonify({'ok': False, 'error': 'BAD_REQUEST',
                     'message': '缺少可操作的配置字段，请参考 API 文档'}), 400
@@ -2670,13 +3028,13 @@ def api_v1_config():
 @app.route('/api/v1/proxy', methods=['GET', 'POST'])
 def api_v1_proxy():
     settings0 = load_settings()
+    host = request.host.split(':', 1)[0]
+    kwargs = _json_body()
     supplied = request.args.get('key', '') or request.headers.get('X-API-Key', '') or \
-        (_json_body()).get('key', '')
+        kwargs.get('key', '') or kwargs.get('api_key', '')
     expected = (settings0.get('api_key') or '').strip()
     if expected and not secrets.compare_digest(supplied, expected):
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
-    host = request.host.split(':', 1)[0]
-    kwargs = _json_body()
     fmt = request.args.get('format') or kwargs.get('format', 'json')
     session_id = (request.args.get('session') or kwargs.get('session', '')).strip()
     consume = request.args.get('consume') or kwargs.get('consume', '')
@@ -2721,12 +3079,12 @@ def api_v1_proxy():
 @app.route('/api/v1/proxy/destroy', methods=['GET', 'POST'])
 def api_v1_proxy_destroy():
     settings0 = load_settings()
+    kwargs = _json_body()
     supplied = request.args.get('key', '') or request.headers.get('X-API-Key', '') or \
-        (_json_body()).get('key', '')
+        kwargs.get('key', '') or kwargs.get('api_key', '')
     expected = (settings0.get('api_key') or '').strip()
     if expected and not secrets.compare_digest(supplied, expected):
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
-    kwargs = _json_body()
     session_id = (request.args.get('session') or kwargs.get('session', '')).strip()
     if not session_id:
         return jsonify({'ok': False, 'error': 'SESSION_REQUIRED', 'message': '销毁必须带 session 参数'}), 400
@@ -2744,54 +3102,70 @@ HTML = r'''<!DOCTYPE html>
 <title>Mihomo Relay WebUI - Mihomo 代理中转管理终端</title>
 <style>
 :root{
-  --bg:#f4f6fb;--panel:#ffffff;--panel2:#fbfcfe;--line:#e3e8f0;
-  --txt:#1c2739;--mut:#5b6a84;--dim:#8b96ab;
-  --acc:#2f6bff;--acc2:#4d8dff;--grn:#16a34a;--red:#dc2626;--amb:#b45309;--cyn:#0369a1;
-  --grad:linear-gradient(135deg,#2f6bff,#4d8dff);
-  --sh:0 1px 3px rgba(16,24,40,.06);
+  --bg:#f5f7fa;--panel:#ffffff;--panel2:#f5f7fa;--line:#e5e8f0;
+  --txt:#1f2430;--mut:#7a8194;--dim:#9aa1b2;
+  --acc:#7c3aed;--acc2:#7c3aed;--grn:#16a34a;--red:#dc2626;--amb:#d97706;--cyn:#0284c7;
+  --grad:#7c3aed;
+  --sh:none;
 }
 *{box-sizing:border-box}
 html,body{margin:0}
-body{font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;padding:0 16px 48px}
-.wrap{max-width:940px;margin:0 auto}
-header{display:flex;align-items:center;gap:14px;padding:26px 4px 6px;flex-wrap:wrap}
-.logo{width:42px;height:42px;border-radius:10px;background:var(--acc);display:grid;place-items:center;font-weight:800;font-size:15px;color:#fff;letter-spacing:.5px}
-header h1{font-size:19px;margin:0;font-weight:700}
-header .sub{font-size:12px;color:var(--mut);margin-top:2px}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--line);background:var(--panel);color:var(--mut)}
-.pill .dot{width:8px;height:8px;border-radius:50%;background:var(--mut)}
-.pill.on{color:var(--grn);border-color:rgba(22,163,74,.35);background:rgba(22,163,74,.08)}
-.pill.on .dot{background:var(--grn)}
-.pill.off{color:var(--red);border-color:rgba(220,38,38,.35);background:rgba(220,38,38,.08)}
-.pill.off .dot{background:var(--red)}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0;box-shadow:var(--sh)}
-.card h2{margin:0 0 14px;font-size:15px;font-weight:700;display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
+body{font-family:"Segoe UI","Microsoft YaHei",system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;font-size:14px}
+a{color:var(--acc);text-decoration:none}
+.app{display:flex;min-height:100vh}
+.sidebar{width:220px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:16px 0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:10px;padding:0 20px 16px}
+.brand .logo{width:36px;height:36px;border-radius:9px;background:var(--acc);display:grid;place-items:center;font-weight:700;color:#fff;font-size:14px;letter-spacing:.5px;flex:none}
+.brand .bname{font-weight:700;font-size:15px}
+.brand .bsub{font-size:11.5px;color:var(--dim);margin-top:2px}
+.nav{display:flex;flex-direction:column;gap:0;margin-top:4px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;border-radius:0;background:transparent;color:var(--txt);border:none;border-left:3px solid transparent;cursor:pointer;font-size:14px;font-weight:400;text-align:left;margin:0;transition:.15s}
+.nav-item:hover{background:rgba(124,58,237,.05);color:var(--acc)}
+.nav-item.active{background:rgba(124,58,237,.08);color:var(--acc);border-left-color:var(--acc);font-weight:500}
+.nav-item .ni{font-size:14px;width:18px;text-align:center;flex:none}
+.sidebar-foot{margin-top:auto;padding:12px 20px 0;border-top:1px solid var(--line)}
+.sidebar-foot .sess{font-size:11.5px;color:var(--dim);margin-bottom:8px;line-height:1.7}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;gap:12px;padding:12px 24px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel);z-index:5}
+.topbar .title{font-size:16px;font-weight:600}
+.top-actions{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.btn-ghost{background:var(--panel);color:var(--txt);border:1px solid var(--line);padding:8px 16px;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;margin:0;display:inline-block;line-height:1.5}
+.btn-ghost:hover{color:var(--acc);border-color:var(--acc);background:var(--panel)}
+.page{padding:20px 24px 56px;max-width:1120px;width:100%}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:500;border:none;background:rgba(122,129,148,.12);color:var(--mut)}
+.pill .dot{display:none}
+.pill.on{color:var(--grn);background:rgba(22,163,74,.12)}
+.pill.off{color:var(--red);background:rgba(220,38,38,.12)}
+.login-wrap{max-width:400px;margin:80px auto;padding:0 16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0}
+.card h2{margin:0 0 14px;font-size:16px;font-weight:600;display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none;gap:10px}
 .card h2 .tag{display:inline-flex;align-items:center;gap:10px;min-width:0}
-.card h2 .ico{width:26px;height:26px;border-radius:7px;background:var(--acc);display:inline-grid;place-items:center;font-size:12px;font-weight:800;color:#fff;flex:none}
-.card h2 .arr{width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid var(--mut);transition:transform .25s;flex:none}
+.card h2 .ico{width:26px;height:26px;border-radius:8px;background:rgba(124,58,237,.1);color:var(--acc);display:inline-grid;place-items:center;font-size:12px;font-weight:700;flex:none}
+.card h2 .arr{width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid var(--dim);transition:transform .25s;flex:none}
 .card.collapsed .arr{transform:rotate(-90deg)}
 .card.collapsed .content{display:none}
-.card h2 .hint{font-size:11px;color:var(--dim);font-weight:400;margin-left:auto;padding-right:8px}
+.card h2 .hint{font-size:11.5px;color:var(--dim);font-weight:400;margin-left:auto;padding-right:8px}
 .content{margin-top:4px}
-label{display:block;font-size:12px;color:var(--mut);margin:10px 0 4px;letter-spacing:.3px}
-input,select,textarea{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--txt);font-size:13.5px;outline:none;transition:border-color .15s,box-shadow .15s}
-input:focus,select:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(47,107,255,.12)}
+label{display:block;font-size:12.5px;color:var(--mut);margin:10px 0 4px}
+input,select,textarea{width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--txt);font-size:14px;outline:none;transition:border-color .15s,box-shadow .15s;line-height:1.5}
+input::placeholder,textarea::placeholder{color:var(--dim)}
+input:focus,select:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(124,58,237,.12)}
 textarea{font-family:ui-monospace,Consolas,monospace;resize:vertical}
-button{padding:8px 18px;border:none;border-radius:8px;background:var(--acc);color:#fff;cursor:pointer;font-size:13.5px;font-weight:600;margin-top:10px;transition:filter .15s}
-button:hover{filter:brightness(1.08)}
+button{padding:8px 16px;border:none;border-radius:8px;background:var(--acc);color:#fff;cursor:pointer;font-size:14px;font-weight:500;line-height:1.5;margin-top:10px;transition:.15s}
+button:hover{background:#6d28d9}
 button:active{transform:translateY(1px)}
-.btn-red{background:#dc2626}
-.btn-blue{background:#2f6bff}
-.btn-small{padding:4px 12px;font-size:12px;margin:2px;border-radius:7px}
+.btn-red{background:var(--red)}.btn-red:hover{background:#b91c1c}
+.btn-blue{background:var(--acc)}.btn-blue:hover{background:#6d28d9}
+.btn-small{padding:6px 14px;font-size:12.5px;font-weight:600;margin:2px;border-radius:6px}
 .row{display:flex;gap:10px;flex-wrap:wrap}.row>div,.row>form{flex:1;min-width:150px}
-.status{padding:10px 14px;border-radius:8px;margin:10px 0;font-size:13.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.status.ok{background:rgba(22,163,74,.08);border:1px solid rgba(22,163,74,.3);color:var(--grn)}
-.status.err{background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);color:var(--red)}
-pre{background:#f8fafc;border:1px solid var(--line);padding:12px;border-radius:8px;overflow:auto;font-size:12px;max-height:400px;color:#3b4a63}
+.status{padding:10px 14px;border-radius:8px;margin:10px 0;font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.status.ok{background:rgba(22,163,74,.08);border:1px solid rgba(22,163,74,.3);color:#15803d}
+.status.err{background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);color:#b91c1c}
+pre{background:#f5f7fa;border:1px solid var(--line);padding:12px 14px;border-radius:8px;overflow:auto;font-size:12px;max-height:400px;color:#3a4258;line-height:1.7}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.note{font-size:12.5px;color:var(--mut);margin:10px 0;padding:10px 14px;background:rgba(180,83,9,.06);border:1px solid rgba(180,83,9,.2);border-left:3px solid var(--amb);border-radius:8px;line-height:1.7}
+.note{font-size:12.5px;color:var(--mut);margin:10px 0;padding:10px 14px;background:rgba(217,119,6,.07);border:1px solid rgba(217,119,6,.22);border-left:3px solid var(--amb);border-radius:8px;line-height:1.75}
 .note b{color:var(--txt)}
-.note.warning{background:rgba(220,38,38,.06);border-color:rgba(220,38,38,.25);border-left-color:var(--red)}
+.note.warning{background:rgba(239,68,68,.07);border-color:rgba(239,68,68,.25);border-left-color:var(--red)}
 .terminal-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 .terminal-card{border:1px solid var(--line);border-radius:10px;padding:14px;min-width:0;background:var(--panel2)}
 .terminal-card h3{margin:0 0 10px;font-size:14px;display:flex;align-items:center;gap:6px}
@@ -2799,76 +3173,100 @@ pre{background:#f8fafc;border:1px solid var(--line);padding:12px;border-radius:8
 .inline-check input{width:auto}
 .secret-wrap{display:flex;gap:6px}.secret-wrap input{flex:1}.secret-wrap button{margin:0;padding:6px 12px}
 .mini-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.mini-actions button{margin:0;padding:6px 12px}
-.copy-value{font:12px ui-monospace,Consolas,monospace;overflow-wrap:anywhere;color:var(--cyn);background:rgba(3,105,161,.06);border:1px dashed rgba(3,105,161,.3);border-radius:6px;padding:4px 8px;display:inline-block;max-width:100%}
-.tabs{display:flex;gap:6px;margin:16px 0 4px;flex-wrap:wrap}
-.tab{padding:8px 18px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--mut);cursor:pointer;font-size:13.5px;font-weight:600;margin:0;box-shadow:none}
-.tab:hover{color:var(--txt)}
-.tab.active{background:var(--acc);color:#fff;border-color:transparent}
+.copy-value{font:12px ui-monospace,Consolas,monospace;overflow-wrap:anywhere;color:var(--txt);background:#f5f7fa;border:1px solid var(--line);border-radius:8px;padding:8px 12px;display:inline-block;max-width:100%;line-height:1.5}
+.cv-row{display:flex;gap:8px;align-items:center;margin:6px 0}
+.cv-row .copy-value{flex:1;min-width:0}
+.cv-row button{margin:0;padding:6px 14px;font-size:12.5px;font-weight:600;border-radius:6px;flex:none}
 .steps{display:flex;flex-direction:column;gap:10px}
 .step{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)}
 .step .n{flex:none;width:26px;height:26px;border-radius:50%;background:var(--panel);border:1px solid var(--line);display:grid;place-items:center;font-size:12px;font-weight:700;color:var(--mut)}
 .step.done .n{background:var(--grn);border-color:transparent;color:#fff}
-.step.done{opacity:.8}
+.step.done{opacity:.85}
 .step b{color:var(--txt)}
-.step .d{font-size:12.5px;color:var(--mut);line-height:1.7}
+.step .d{font-size:12.5px;color:var(--mut);line-height:1.75}
 .qs-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
 .qs-row .copy-value{flex:1;min-width:220px}
 .port-table td:first-child{font-family:ui-monospace,Consolas,monospace;color:var(--cyn)}
 .api-card h3{margin:16px 0 6px;font-size:14px;display:flex;align-items:center;gap:8px}
-.api-card h3 .m{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;background:rgba(47,107,255,.1);color:var(--acc)}
+.api-card h3 .m{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;background:rgba(124,58,237,.12);color:var(--acc)}
 .api-card .path{font:12px ui-monospace,Consolas,monospace;color:var(--amb)}
-.api-card .params{font-size:12.5px;color:var(--mut);line-height:1.8}
+.api-card .params{font-size:12.5px;color:var(--mut);line-height:1.85}
 .api-card .params code{color:var(--cyn)}
 .cmd-row{display:flex;gap:8px;align-items:center;margin-top:8px}
 .cmd-row pre{flex:1;margin:0}
 .cmd-row button{margin:0;padding:6px 14px}
-.toast{display:none;position:fixed;right:20px;bottom:20px;background:#1f2937;color:#fff;padding:10px 16px;border-radius:8px;z-index:10;border:1px solid var(--line);box-shadow:0 8px 24px rgba(16,24,40,.18);font-size:13px}
-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;border-radius:8px;overflow:hidden}
-th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left}
-th{background:rgba(47,107,255,.06);color:var(--mut);font-weight:600;font-size:12px;letter-spacing:.4px}
-tbody tr:hover{background:rgba(47,107,255,.04)}
+.toast{display:none;position:fixed;right:20px;bottom:20px;background:#ffffff;color:var(--txt);padding:10px 16px;border-radius:8px;z-index:20;border:1px solid var(--line);box-shadow:0 10px 30px rgba(31,36,48,.15);font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px;border-radius:8px;overflow:hidden}
+th,td{border-bottom:1px solid var(--line);padding:7px 12px;text-align:left}
+th{background:transparent;color:var(--mut);font-weight:600;font-size:12px;letter-spacing:.4px;padding:8px 12px}
+tbody tr:hover{background:rgba(124,58,237,.04)}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
-.stat{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.stat{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
 .stat .k{font-size:11.5px;color:var(--mut);letter-spacing:.5px}
-.stat .v{font-size:20px;font-weight:800;margin-top:4px}
+.stat .v{font-size:20px;font-weight:600;margin-top:4px}
 .stat .v.grn{color:var(--grn)}.stat .v.red{color:var(--red)}.stat .v.acc{color:var(--acc)}.stat .v.amb{color:var(--amb)}
-.cur{font-size:11px;color:var(--grn);font-weight:600;background:rgba(22,163,74,.1);border:1px solid rgba(22,163,74,.3);padding:2px 8px;border-radius:999px;margin-left:6px;white-space:nowrap}
-code{background:rgba(47,107,255,.1);color:var(--acc);padding:1px 6px;border-radius:5px;font-size:12px}
-@media(max-width:720px){.terminal-grid,.grid2{grid-template-columns:1fr}.row{flex-direction:column}.row>div,.row>form{flex:auto;min-width:0}.stats{grid-template-columns:repeat(2,1fr)}}
+.cur{font-size:11px;color:var(--grn);font-weight:600;background:rgba(22,163,74,.12);border:none;padding:2px 8px;border-radius:10px;margin-left:6px;white-space:nowrap}
+code{background:rgba(124,58,237,.1);color:var(--acc);padding:1px 6px;border-radius:5px;font-size:12px}
+.wl-toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0}
+.wl-toolbar input{width:auto;flex:1;min-width:150px}
+.wl-toolbar button{margin:0}
+.wl-toolbar .spacer{flex:1 1 auto}
+.wl-toolbar #wlSearch{flex:0 1 200px;min-width:120px}
+.mono{font-family:ui-monospace,Consolas,monospace;color:var(--txt)}
+.dim{color:var(--dim)}
+.empty{text-align:center;color:var(--dim);padding:20px}
+@media(max-width:860px){.app{flex-direction:column}.sidebar{width:auto;height:auto;position:static}.nav{flex-direction:row;flex-wrap:wrap}.sidebar-foot{margin-top:8px}}
+@media(max-width:720px){.terminal-grid,.grid2{grid-template-columns:1fr}.row{flex-direction:column}.row>div,.row>form{flex:auto;min-width:0}.stats{grid-template-columns:repeat(2,1fr)}.page{padding:16px}}
 </style>
 </head>
 <body>
-<div class="wrap">
-<header>
-<div class="logo">MR</div>
-<div>
-<h1>Mihomo Relay WebUI</h1>
-<div class="sub">Mihomo 代理中转管理终端 · 粘性会话</div>
-</div>
-{% if authed %}
-<div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
-<span class="pill {{ 'on' if sticky.enabled else 'off' }}"><span class="dot"></span>粘性会话 {{ '已开启' if sticky.enabled else '已关闭' }}</span>
-<span class="pill {{ 'on' if status.alive else 'off' }}"><span class="dot"></span>代理 {{ '正常' if status.alive else '异常' }}</span>
-</div>
-{% endif %}
-</header>
-
 {% if not authed %}
-<div class="card" style="max-width:400px;margin:60px auto;text-align:center">
-<h2 style="justify-content:center"><span class="tag">登录管理面板</span><span class="arr"></span></h2>
+<div class="login-wrap">
+<div class="brand" style="justify-content:center;padding-bottom:18px">
+<div class="logo">MR</div>
+<div><div class="bname">Mihomo Relay</div><div class="bsub">代理中转管理终端</div></div>
+</div>
+<div class="card" style="text-align:center">
+<h2 style="justify-content:center"><span class="tag">登录管理面板</span></h2>
 <form method="post" action="/login">
 <input type="password" name="pwd" placeholder="管理密码" style="text-align:center">
 <button type="submit" style="width:100%">进入</button>
 </form>
 </div>
+</div>
 {% else %}
 
-<nav class="tabs" id="mainTabs">
-<button type="button" class="tab active" data-tab="overview" onclick="switchTab('overview')">概览</button>
-<button type="button" class="tab" data-tab="config" onclick="switchTab('config')">连接配置</button>
-<button type="button" class="tab" data-tab="sticky" onclick="switchTab('sticky')">粘性会话</button>
-<button type="button" class="tab" data-tab="api" onclick="switchTab('api')">API 文档</button>
+<div class="app">
+<aside class="sidebar">
+<div class="brand">
+<div class="logo">MR</div>
+<div><div class="bname">Mihomo Relay</div><div class="bsub">代理中转管理终端</div></div>
+</div>
+<nav class="nav" id="mainNav">
+<button type="button" class="nav-item active" data-tab="overview" onclick="switchTab('overview')"><span class="ni">◈</span>概览</button>
+<button type="button" class="nav-item" data-tab="config" onclick="switchTab('config')"><span class="ni">⚙</span>连接配置</button>
+<button type="button" class="nav-item" data-tab="sticky" onclick="switchTab('sticky')"><span class="ni">◎</span>粘性会话</button>
+<button type="button" class="nav-item" data-tab="whitelist" onclick="switchTab('whitelist')"><span class="ni">🛡</span>白名单</button>
+<button type="button" class="nav-item" data-tab="api" onclick="switchTab('api')"><span class="ni">{}</span>API 文档</button>
 </nav>
+<div class="sidebar-foot">
+<div class="sess">
+<div>代理：{{ '正常' if status.alive else '异常' }}</div>
+<div>粘性会话：{{ '已开启' if sticky.enabled else '已关闭' }}</div>
+</div>
+<a class="btn-ghost" href="/logout" style="display:block;text-align:center;text-decoration:none">退出登录</a>
+<button type="button" class="btn-ghost" style="width:100%;margin-top:6px" onclick="location.reload()">刷新</button>
+</div>
+</aside>
+<main class="main">
+<div class="topbar">
+<div class="title" id="pageTitle">概览</div>
+<div class="top-actions">
+<span class="pill {{ 'on' if status.alive else 'off' }}"><span class="dot"></span>代理 {{ '正常' if status.alive else '异常' }}</span>
+<span class="pill {{ 'on' if sticky.enabled else 'off' }}"><span class="dot"></span>粘性会话 {{ '已开启' if sticky.enabled else '已关闭' }}</span>
+</div>
+</div>
+<div class="page">
 
 <div class="card" data-tab="overview">
 <h2><span class="tag"><span class="ico">状</span>当前状态</span><span class="arr"></span></h2>
@@ -3034,7 +3432,7 @@ code{background:rgba(47,107,255,.1);color:var(--acc);padding:1px 6px;border-radi
 <h3>API 控制接口</h3>
 <label>监听地址</label><p class="copy-value">http://{{ public_host }}:7892</p>
 <label>API Key</label><div class="secret-wrap"><input type="password" name="api_key" value="" placeholder="已保存，留空保留" autocomplete="new-password"><button type="button" class="btn-blue" onclick="toggleSecret(this)">显示</button></div>
-{% for endpoint in ['connections','status','rotate','session/list','pool/status'] %}<p class="copy-value">/api/{{ endpoint }}</p><button type="button" class="btn-blue" onclick="copyApi('{{ endpoint }}')">复制 {{ endpoint }}</button>{% endfor %}
+{% for endpoint in ['connections','status','rotate','session/list','pool/status'] %}<div class="cv-row"><p class="copy-value">/api/{{ endpoint }}</p><button type="button" class="btn-blue" onclick="copyApi('{{ endpoint }}')">复制</button></div>{% endfor %}
 </div>
 </div>
 <button type="submit">保存对外连接设置</button>
@@ -3122,10 +3520,10 @@ code{background:rgba(47,107,255,.1);color:var(--acc);padding:1px 6px;border-radi
 <input type="hidden" name="scenario" value="F">
 <label>Clash 订阅 URL</label>
 <input type="text" name="clash_url" placeholder="https://example.com/sub?token=xxx" value="{{ settings.saved_scenarios.get('F',{}).get('clash_url','') }}">
-<label>模式</label>
+<label>用途模式</label>
 <select name="f_mode">
-<option value="direct" {% if settings.saved_scenarios.get('F',{}).get('mode')!='poll' %}selected{% endif %}>直连模式（粘性，不过期，故障自动切换）</option>
-<option value="poll" {% if settings.saved_scenarios.get('F',{}).get('mode')=='poll' %}selected{% endif %}>轮询模式（粘性，10分钟过期）</option>
+<option value="poll" {% if settings.saved_scenarios.get('F',{}).get('mode')=='poll' %}selected{% endif %}>注册模式（每个任务分配不同 IP，全部经过可用性检测）</option>
+<option value="direct" {% if settings.saved_scenarios.get('F',{}).get('mode')!='poll' %}selected{% endif %}>正常模式（固定使用一个可用 IP，长期稳定）</option>
 </select>
 <button type="submit">保存应用</button>
 </form>
@@ -3139,12 +3537,57 @@ code{background:rgba(47,107,255,.1);color:var(--acc);padding:1px 6px;border-radi
 <div class="status {{ 'ok' if success else 'err' }}">{{ message }}</div>
 {% endif %}
 
+<div class="card" data-tab="whitelist">
+<h2><span class="tag"><span class="ico">W</span>来源 IP 白名单</span><span class="hint">名单内 IP 调用 API 免 Key</span><span class="arr"></span></h2>
+<div class="content">
+<div class="note">
+<b>作用</b>：名单内的来源 IP 调用 <code>/api/*</code> 时<b>无需携带 API Key</b>，直接放行。支持单个 <code>IPv4</code> / <code>IPv6</code> 以及 <code>CIDR</code> 网段（如 <code>10.0.0.0/8</code>）。本机回环地址 <code>127.0.0.1</code> 始终放行。
+</div>
+<div class="wl-toolbar">
+<input type="text" id="wlIp" placeholder="IP 或 CIDR，如 1.2.3.4 / 10.0.0.0/8">
+<input type="text" id="wlNote" placeholder="备注（可选）">
+<button type="button" class="btn-blue btn-small" onclick="wlAdd()">＋ 添加</button>
+<button type="button" class="btn-blue btn-small" onclick="wlAddMine()">添加我的 IP</button>
+<span class="spacer"></span>
+<input type="text" id="wlSearch" placeholder="搜索 IP / 备注" oninput="wlFilter()">
+<button type="button" class="btn-red btn-small" onclick="wlDeleteSelected()">批量删除</button>
+</div>
+<table id="wlTable">
+<thead>
+<tr>
+<th style="width:34px"><input type="checkbox" id="wlAll" onclick="wlToggleAll(this)" style="width:auto"></th>
+<th>IP / CIDR</th><th>归属地</th><th>ISP</th><th>备注</th><th>添加时间</th><th style="width:80px">操作</th>
+</tr>
+</thead>
+<tbody id="wlBody">
+{% for e in whitelist %}
+<tr data-ip="{{ e.ip }}">
+<td><input type="checkbox" class="wl-ck" style="width:auto"></td>
+<td class="mono">{{ e.ip }}{% if e.ip == client_ip %}<span class="cur">当前</span>{% endif %}</td>
+<td class="dim">{{ e.region or '—' }}</td>
+<td class="dim">{{ e.isp or '—' }}</td>
+<td>{{ e.note or '—' }}</td>
+<td class="dim">{{ e.ts_str }}</td>
+<td><button type="button" class="btn-red btn-small" onclick="wlDelete('{{ e.ip }}')">删除</button></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<div id="wlEmpty" class="empty" style="display:{{ 'none' if whitelist else 'block' }}">暂无白名单条目</div>
+<div class="note" style="margin-top:10px">
+<b>免 Key 调用示例</b>：当来源 IP 在白名单内时，下列请求无需 <code>?key=</code> 即可通过。当前访问来源 IP：<code>{{ client_ip or '未知' }}</code>
+</div>
+<div class="cmd-row"><pre id="wlCurl">curl "http://{{ public_host }}:7892/api/status"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('wlCurl')">复制</button></div>
+</div>
+</div>
+
 <div class="card api-card" data-tab="api">
 <h2><span class="tag"><span class="ico">API</span>API 文档</span><span class="arr"></span></h2>
 <div class="content">
 <div class="note">
 <b>认证方式</b>：所有 API 均需携带 API Key，两种方式任选：URL 参数 <code>?key=YOUR_KEY</code> 或请求头 <code>X-API-Key: YOUR_KEY</code>。
 未授权返回 <code>401</code>。下面所有示例已自动带上当前 Key，可直接复制执行。<br>
+<b>免 Key 白名单</b>：若请求来源 IP 已在「白名单」页中登记（支持 IPv4 / IPv6 / CIDR），则调用 <code>/api/*</code> 时可省略 Key；本机回环 <code>127.0.0.1</code> 始终放行。<br>
 <b>Base URL</b>：<code>http://{{ public_host }}:7892</code>
 </div>
 
@@ -3197,6 +3640,21 @@ curl -X POST -H 'Content-Type: application/json' -d '{"task_id": "my_task"}' "ht
 curl -X POST -H 'Content-Type: application/json' -d '{"task_id": "req_001"}' "http://{{ public_host }}:7892/api/session/acquire?key={{ api_key }}"
 
 # 通过返回的 listener_port 发请求（每个 task_id 一条独立链路）</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-e-flow')">复制</button></div>
+
+<h3 style="margin-top:22px"><span class="m">白名单</span> 来源 IP 白名单</h3>
+<div class="params">名单内的来源 IP 调用 <code>/api/*</code> 时无需携带 Key；支持单 <code>IPv4</code> / <code>IPv6</code> 与 <code>CIDR</code> 网段。管理接口需面板登录或有效 Key。</div>
+
+<h4 style="margin:14px 0 4px;font-size:13px">GET <span class="path">/api/whitelist</span> <span class="cur" style="margin-left:0">查询列表</span></h4>
+<div class="params">返回 <code>entries</code>（含 IP / 归属地 / ISP / 备注 / 添加时间）、<code>total</code>、当前请求 <code>client_ip</code> 与 <code>whitelisted</code> 状态。</div>
+<div class="cmd-row"><pre id="api-wl-list">curl "http://{{ public_host }}:7892/api/whitelist?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-wl-list')">复制</button></div>
+
+<h4 style="margin:14px 0 4px;font-size:13px">POST <span class="path">/api/whitelist</span> <span class="cur" style="margin-left:0">添加条目</span></h4>
+<div class="params">body：<code>{"ip": "1.2.3.4", "note": "备注"}</code>。单 IP 会自动查询归属地；重复添加返回 <code>409</code>，格式错误返回 <code>400</code>。</div>
+<div class="cmd-row"><pre id="api-wl-add">curl -X POST -H 'Content-Type: application/json' -d '{"ip": "1.2.3.4", "note": "我的出口"}' "http://{{ public_host }}:7892/api/whitelist?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-wl-add')">复制</button></div>
+
+<h4 style="margin:14px 0 4px;font-size:13px">DELETE <span class="path">/api/whitelist</span> <span class="cur" style="margin-left:0">删除条目</span></h4>
+<div class="params">支持单个 <code>ip</code> 或批量 <code>ips</code>（数组，或逗号分隔字符串）。</div>
+<div class="cmd-row"><pre id="api-wl-del">curl -X DELETE -H 'Content-Type: application/json' -d '{"ips": ["1.2.3.4", "10.0.0.0/8"]}' "http://{{ public_host }}:7892/api/whitelist?key={{ api_key }}"</pre><button type="button" class="btn-blue btn-small" onclick="copyCmd('api-wl-del')">复制</button></div>
 </div>
 </div>
 
@@ -3207,14 +3665,24 @@ curl -X POST -H 'Content-Type: application/json' -d '{"task_id": "req_001"}' "ht
 </div>
 {% endif %}
 
+</div>
+</main>
+</div>
+
 <script>
+const TAB_TITLES = {overview: '概览', config: '连接配置', sticky: '粘性会话', whitelist: '白名单', api: 'API 文档'};
 function switchTab(name) {
-    document.querySelectorAll('#mainTabs .tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+    if (!TAB_TITLES[name]) name = 'overview';
+    document.querySelectorAll('#mainNav .nav-item').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
     document.querySelectorAll('.card[data-tab]').forEach(c => {
         c.style.display = c.dataset.tab === name ? '' : 'none';
     });
+    const pt = document.getElementById('pageTitle');
+    if (pt) pt.textContent = TAB_TITLES[name];
+    try { if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name); } catch (e) {}
     window.scrollTo({top: 0});
 }
+window.addEventListener('hashchange', () => switchTab((location.hash || '#overview').slice(1)));
 function copyCmd(id) {
     const el = document.getElementById(id);
     copyText(el.textContent.trim());
@@ -3231,7 +3699,7 @@ document.querySelectorAll('.card h2').forEach(h2 => {
         h2.parentElement.classList.toggle('collapsed');
     });
 });
-switchTab('overview');
+switchTab((location.hash || '#overview').slice(1));
 const terminalSettings = {{ settings_public|tojson }};
 function toggleSecret(btn) {
     const input = btn.previousElementSibling;
@@ -3309,10 +3777,80 @@ function runAction(act, btn) {
             notify('请求超时或无响应：' + e);
         });
 }
+// ==================== 白名单管理 ====================
+const CLIENT_IP = {{ client_ip|tojson }};
+function wlEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function wlRender(entries) {
+    const body = document.getElementById('wlBody');
+    if (!body) return;
+    entries = entries || [];
+    body.innerHTML = entries.map(e => '<tr data-ip="' + wlEsc(e.ip) + '">'
+        + '<td><input type="checkbox" class="wl-ck" style="width:auto"></td>'
+        + '<td class="mono">' + wlEsc(e.ip) + (e.ip === CLIENT_IP ? '<span class="cur">当前</span>' : '') + '</td>'
+        + '<td class="dim">' + (wlEsc(e.region) || '—') + '</td>'
+        + '<td class="dim">' + (wlEsc(e.isp) || '—') + '</td>'
+        + '<td>' + (wlEsc(e.note) || '—') + '</td>'
+        + '<td class="dim">' + (wlEsc(e.ts_str) || '—') + '</td>'
+        + '<td><button type="button" class="btn-red btn-small" onclick="wlDelete(this.closest(\'tr\').dataset.ip)">删除</button></td>'
+        + '</tr>').join('');
+    const empty = document.getElementById('wlEmpty');
+    if (empty) empty.style.display = entries.length ? 'none' : 'block';
+    wlFilter();
+}
+function wlFetch() {
+    fetch('/api/whitelist').then(r => r.json()).then(d => {
+        if (d && d.ok) wlRender(d.entries);
+    }).catch(() => {});
+}
+function wlAdd() {
+    const ip = document.getElementById('wlIp').value.trim();
+    const note = document.getElementById('wlNote').value.trim();
+    if (!ip) return notify('请输入 IP 或 CIDR');
+    fetch('/api/whitelist', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ip: ip, note: note})})
+        .then(r => r.json()).then(d => {
+            notify(d.message || (d.ok ? '已添加' : '添加失败'));
+            if (d.ok) { document.getElementById('wlIp').value = ''; document.getElementById('wlNote').value = ''; wlFetch(); }
+        }).catch(e => notify('请求失败：' + e));
+}
+function wlAddMine() {
+    if (!CLIENT_IP) return notify('无法识别来源 IP');
+    document.getElementById('wlIp').value = CLIENT_IP;
+    document.getElementById('wlNote').value = '本机';
+    wlAdd();
+}
+function wlDelete(ip) {
+    if (!ip) return;
+    if (!confirm('确认删除 ' + ip + ' ？')) return;
+    fetch('/api/whitelist', {method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ip: ip})})
+        .then(r => r.json()).then(d => { notify(d.message || (d.ok ? '已删除' : '删除失败')); wlFetch(); })
+        .catch(e => notify('请求失败：' + e));
+}
+function wlDeleteSelected() {
+    const ips = Array.from(document.querySelectorAll('#wlBody .wl-ck:checked')).map(c => c.closest('tr').dataset.ip);
+    if (!ips.length) return notify('请先勾选要删除的条目');
+    if (!confirm('确认删除选中的 ' + ips.length + ' 条？')) return;
+    fetch('/api/whitelist', {method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ips: ips})})
+        .then(r => r.json()).then(d => { notify(d.message || (d.ok ? '已删除' : '删除失败')); wlFetch(); })
+        .catch(e => notify('请求失败：' + e));
+}
+function wlToggleAll(box) {
+    document.querySelectorAll('#wlBody .wl-ck').forEach(c => c.checked = box.checked);
+}
+function wlFilter() {
+    const q = ((document.getElementById('wlSearch') || {}).value || '').trim().toLowerCase();
+    let visible = 0, total = 0;
+    document.querySelectorAll('#wlBody tr').forEach(tr => {
+        total++;
+        const hit = !q || tr.textContent.toLowerCase().indexOf(q) !== -1;
+        tr.style.display = hit ? '' : 'none';
+        if (hit) visible++;
+    });
+    const empty = document.getElementById('wlEmpty');
+    if (empty && total) empty.style.display = visible ? 'none' : 'block';
+}
 </script>
 <div id="toast" class="toast"></div>
 {% endif %}
-</div>
 </body>
 </html>'''
 

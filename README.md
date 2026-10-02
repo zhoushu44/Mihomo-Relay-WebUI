@@ -4,13 +4,15 @@
 
 基于 mihomo（Clash.Meta）的 Web 代理中转管理面板，支持直连、SOCKS5/HTTP 上游代理、API 按需提取和 Clash 订阅轮换，并向外提供带独立认证的 SOCKS5、HTTP 与 API 入口，支持粘性会话（每个调用方独立端口，端口即身份）。
 
-- **前端**：React 单页应用（首页 / 连接配置 / API Key 三页 + 公开 API 文档页）
-- **登录**：API Key（一套 Key 管全部：代理提取 + 连接配置 + 管理面板）
+- **前端**：服务端渲染单页面板（概览 / 连接配置 / 粘性会话 / 白名单 / API 文档），浅色主题 + 左侧边栏
+- **登录**：面板密码（`UI_PASSWORD`）登录 WebUI；API 走 `API_KEY`
 - **API**：`/api/v1/proxy` 一个接口覆盖共享出口 / 粘性会话 / 消耗式提取
+- **白名单**：来源 IP 免 Key 调用 API，支持 IPv4 / IPv6 / CIDR
 
 ## 功能特性
 
-- **React WebUI**（2026-08 重写）：状态概览、连接配置、API Key 管理、公开 API 文档页
+- **WebUI**（2026-10 改版）：浅色主题 + 左侧边栏，状态概览、连接配置、粘性会话、白名单管理、API 文档
+- **来源 IP 白名单**：名单内 IP 调用 `/api/*` 免 Key（IPv4/IPv6/CIDR，本机 `127.0.0.1` 始终放行），带归属地/ISP 查询
 - **API Key 认证**：URL 参数 / `X-API-Key` 头 / JSON body 三种传法，恒定时间比较
 - **统一取代理 API**：`GET/POST /api/v1/proxy`（共享出口 / 粘性会话 / consume 烧号 / txt 输出）
 - **连接配置 API**：`GET/POST /api/v1/config`（入口模式 / 场景 / 更新 Key，部分更新）
@@ -53,7 +55,7 @@ docker run -d \
 
 ### 3. 登录使用
 
-打开 `http://服务器IP:7892`，输入 **API Key**（见下方"环境变量 `API_KEY`"；未设置时管理接口禁止访问，请先设置）。
+打开 `http://服务器IP:7892`，输入 **管理密码**（环境变量 `UI_PASSWORD`，默认 `mihomo123`；生产环境请务必修改）。
 
 ## Docker Compose（可选）
 
@@ -110,7 +112,7 @@ ufw status
 
 ## 首次使用
 
-1. 打开 `http://服务器IP:7892`，输入 **API Key** 登录
+1. 打开 `http://服务器IP:7892`，输入 **管理密码** 登录
 2. 在「连接配置」页设置 SOCKS5/HTTP 入口账号密码，选择场景，点「保存应用」
 3. 复制连接链接使用（`socks5://用户名:密码@服务器IP:7890`）
 4. 客户接入：调 `/api/v1/proxy?key=KEY&session=客户ID` 获取独立端口
@@ -123,6 +125,26 @@ ufw status
 | **切换** | 用上次保存的参数直接切换，不用重填（只在已保存过配置时出现） |
 
 当前场景显示绿色 `● 当前` 标记，已保存参数自动填回输入框。
+
+## 配置保存与热更新
+
+「保存应用」/「切换」都会把当前配置写入 `/tmp/mihomo_config.yaml`，然后**向 mihomo 内核发送 `SIGHUP` 热重载**，绝大多数情况下**不重启容器、不断开已有连接**，保存即生效。
+
+| 变更类型 | 生效方式 | 是否重启内核 |
+|----------|----------|--------------|
+| 账号 / 密码 / 场景 / 上游代理列表 | SIGHUP 热重载，**内核进程 pid 不变** | 否 |
+| 粘性会话端口增删 | 热重载 `sticky-{port}` listener | 否 |
+| **同端口切换监听类型**（如 7890 从 SOCKS5 改为 HTTP） | 热重载校验失败 -> 自动兜底重启内核 | 是（仅内核，非容器） |
+
+- 兜底逻辑：热重载后会**实测校验各入口端口**，能连上才算成功；若端口不可达（多见于同端口换 listener 类型，会命中 mihomo `address already in use` 竞态），自动 `restart` 内核进程恢复，**容器本身不受影响**。
+- 因此日常改账号密码 / 端口 / 场景都是**无感热生效**；只有极端的「同端口换协议类型」才会走一次内部重启。
+
+实测（2026-10-03）：
+
+```text
+# 只改密码（不换端口/类型）
+POST /terminal-settings 改密码 -> 内核 pid 保持不变 -> 新密码立即可用、旧密码立即失效 -> SIGHUP 热重载 OK
+```
 
 ## 对外连接格式
 
@@ -167,6 +189,32 @@ curl -X POST "http://IP:7892/api/v1/config?key=KEY" -H 'Content-Type: applicatio
 - 错误码：401 / 403 / 400（缺参）/ 404（会话不存在）/ 409（过期 / 池耗尽）
 - 旧接口（`/api/session/*`、`/api/connections`、`/api/status` 等）兼容保留
 
+## 来源 IP 白名单
+
+名单内的来源 IP 调用 `/api/*` 时**无需携带 API Key**，直接放行；本机回环 `127.0.0.1` / `::1` 始终放行。支持单个 `IPv4` / `IPv6` 以及 `CIDR` 网段（如 `10.0.0.0/8`、`2001:db8::/32`）。
+
+管理接口 `/api/whitelist`（面板登录 / 有效 Key 任一即可操作）：
+
+```bash
+# 查询列表（含当前请求来源 IP 与是否已放行）
+curl "http://IP:7892/api/whitelist?key=KEY"
+
+# 添加（单 IP 自动查询归属地 / ISP）
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"ip":"1.2.3.4","note":"我的出口"}' "http://IP:7892/api/whitelist?key=KEY"
+
+# 批量删除
+curl -X DELETE -H 'Content-Type: application/json' \
+  -d '{"ips":["1.2.3.4","10.0.0.0/8"]}' "http://IP:7892/api/whitelist?key=KEY"
+```
+
+- 添加：格式错误返回 `400`，重复添加返回 `409`（条目自动规范化，如 `10.0.0.1/8` -> `10.0.0.0/8`）
+- 删除：支持单个 `ip` 或批量 `ips`（数组 / 逗号分隔字符串）
+- 匹配：IPv4-mapped IPv6（`::ffff:1.2.3.4`）会剥离前缀后按 `1.2.3.4` 匹配
+- 免 Key 校验的是**真实来源 IP**：经反向代理时读取 `X-Forwarded-For` 首个地址
+
+> 注意：宿主机通过 `127.0.0.1:7892`（docker-proxy）访问时，容器内看到的是网桥地址（如 `172.x.0.1`）而非 `127.0.0.1`；若需按「本机」放行，请使用容器/宿主机的真实回环，或将实际来源 IP 加入白名单。
+
 ## 场景说明
 
 ### 场景 A：直连
@@ -196,12 +244,12 @@ curl -X POST "http://IP:7892/api/v1/config?key=KEY" -H 'Content-Type: applicatio
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `API_KEY` | 随机生成 | **平台统一密钥**：前端登录 + API 鉴权（提取/管理） |
-| `UI_PASSWORD` | `mihomo123` | 旧版 Web 密码（兼容旧模板登录） |
+| `UI_PASSWORD` | `mihomo123` | **面板登录密码**（WebUI 登录） |
+| `API_KEY` | 随机生成 | **API 密钥**：`/api/*` 鉴权（提取 / 管理 / 白名单） |
 | `SECRET_KEY` | 随机生成 | Flask 会话密钥 |
 | `MIHOMO_HOST` | `host.docker.internal` | mihomo 容器地址 |
 
-> 配置目录 `/tmp` 中保存场景、账号密码与 API Key；更换容器需挂载同一 `/tmp` 保留配置。
+> 配置目录 `/tmp` 中保存场景、账号密码、API Key 与白名单；更换容器需挂载同一 `/tmp` 保留配置。
 
 ## 常用命令
 
@@ -222,30 +270,30 @@ docker rm -f mihomo-web mihomo
 
 ```
 Mihomo-Relay-WebUI/
-├── app.py                  # Flask 主程序（后端 + 静态托管 + 全部 API）
+├── app.py                  # Flask 主程序（后端 + 内嵌服务端渲染面板 + 全部 API）
 ├── Dockerfile              # 镜像构建（由 GitHub Actions 自动构建推送）
 ├── docker-compose.yml      # Compose 基础编排
 ├── docker-compose.prod.yml # Compose 生产编排
 ├── deploy.sh               # 源码一键部署脚本（备用）
 ├── .github/workflows/      # CI：构建镜像并推送 1.0 + latest 双标签
-├── frontend/               # React 19 + Vite + TypeScript 前端源码
-│   ├── src/                # App.tsx / api.ts / components.tsx / pages(Home/Connect/ApiKey/ApiDocs/Login)
-│   └── public/             # favicon.svg / icons.svg
-├── static/                 # 前端构建产物（Flask 托管，勿手改）
-│   ├── index.html
-│   └── assets/             # 哈希命名的 JS/CSS
+├── frontend/               # React 19 + Vite + TypeScript 前端源码（历史版本，当前线上为 app.py 内嵌模板）
+├── static/                 # 前端构建产物（Flask 托管）
 └── test_full.py 等          # 回归测试脚本（API 21 项 / 粘性隔离 / 轮换）
 ```
 
-## 验证状态（2026-08-18）
+## 验证状态（2026-10-03）
 
-- **需求文档 v2 A1-A20** 全部实测 PASS；多用户并发粘性 PASS
+- **连通性全项**：SOCKS5 `7890` / HTTP `7891` / HTTPS 走代理均通；认证边界实测 无凭据->`407`、错密码->`403`、正确->`200`
+- **出口稳定性**：连续 5 次请求 4 次成功 IP 轮换（个别慢节点偶发抖动）；github.com `200`、google `generate_204` `204`
+- **配置热更新**：只改密码时内核 pid 不变（纯 SIGHUP 热重载），新密码即时生效、旧密码即时失效，改回后恢复；同端口换监听类型走兜底重启内核（容器不重启）
+- **WebUI 改版**：浅色主题 + 左侧边栏，五个页签（概览/连接配置/粘性会话/白名单/API 文档）Tab 切换与 hash 路由正常
+- **白名单专项 18 项**：非白名单无 Key -> 401；白名单内无 Key -> 200；单 IP 自动查归属地；重复 -> 409；非法格式 -> 400；CIDR 规范化与段内/段外判定；IPv6（`2001:db8::/32`）与 IPv4-mapped 匹配；批量/单条删除后恢复 401；未授权管理接口 -> 401
+- **容器内回环**：`127.0.0.1` 免 Key -> 200、`whitelisted=true`
 - **API 全面回归 21/21 PASS**：鉴权（401/403/200）、共享/粘性/消耗提取、会话生命周期、config 控制、管理接口
-- **React 前端**上线验证 PASS：登录（Key）、三页交互、公开文档页、登出
 - **粘性专项**：不同 session 隔离、同 session 幂等、轮换后端切换端口不变、消耗式烧号、销毁回收
-- **安全实测**：无 Key 无法获取会话端口（401）、无凭据直连被 SOCKS5 认证拒绝；接口畸形 JSON 崩溃已修复并部署
+- **安全实测**：无 Key 无法获取会话端口（401）、无凭据直连被 SOCKS5 认证拒绝
 - **端口开放**：7890 / 7892 / 40001-40999 外部直连验证通过
-- **代码一致性**：容器内 app.py 与前端产物 md5 与本地完全一致
+- **代码一致性**：容器内 app.py 与本地 md5 完全一致
 
 ## 架构与工作原理
 
@@ -257,7 +305,7 @@ Mihomo-Relay-WebUI/
     ├── 粘性   40001-40999
     └── API/Web :7892 ──┘
                         │
-                   mihomo-web（Flask + React）
+                mihomo-web（Flask + 内嵌 WebUI）
                         │ Docker SDK
                         ▼
                      mihomo 容器（host 网络）
