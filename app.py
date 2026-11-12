@@ -32,6 +32,10 @@ SETTINGS_PATH = '/opt/mihomo-relay/terminal_settings.json'
 MIHOMO_HOST = os.environ.get('MIHOMO_HOST', 'host.docker.internal')
 dk = None
 
+# 支持粘性会话的场景（A 是直连，无上游可绑，故不支持）。
+# 每个 session 自带 scenario，可以同时存在不同场景的会话 —— 见 _build_full_config。
+SESSION_SCENARIOS = ('proxy', 'E', 'F')
+
 # ==================== 粘性会话全局状态 ====================
 STICKY_LOCK = threading.Lock()
 RELOAD_LOCK = threading.Lock()
@@ -59,6 +63,8 @@ STICKY_STATE = {
     'e_extract_cd': 0,       # E 测试节点提取失败冷却截止时间戳
     'e_extract_cd_err': '',  # 冷却期直接返回的失败原因
     'pending': {},           # port -> 占位时间戳（提取中，尚未转正为会话）
+    'f_listener_ready': set(),  # 已经写进 mihomo 配置的 F 端口
+    'last_sock_restart': 0,     # 上次因粘性端口 bind 冲突而重启的时间
 }
 
 
@@ -514,6 +520,33 @@ def _entry_listeners_ok(settings=None):
     return True
 
 
+def _sticky_ports_ok(expected_ports):
+    """检查一批粘性端口是否真的在 listen。
+
+    SIGHUP 热重载的固有问题：旧 listener 的 socket 还没释放，新配置里的
+    同名 listener 就 bind 失败，内核只打一行 `address already in use`，
+    **热重载本身返回成功**。结果是端口分给了业务、连上去却没人接，
+    表现为随机 `SSLError` / `ConnectionError` —— 在多会话并发时必现。
+
+    这种情况只能靠重启 mihomo 才能真正释放旧 socket。
+    """
+    if not expected_ports:
+        return True
+    import socket as _socket
+    for port in expected_ports:
+        try:
+            sk = _socket.socket()
+            try:
+                sk.settimeout(1.5)
+                if sk.connect_ex(('127.0.0.1', int(port))) != 0:
+                    return False
+            finally:
+                sk.close()
+        except Exception:
+            return False
+    return True
+
+
 def _apply_config(config_str, settings=None):
     """写配置 + SIGHUP 热重载；重载后校验入口监听，失败自动回退重启容器"""
     with RELOAD_LOCK:
@@ -535,6 +568,42 @@ def _apply_config(config_str, settings=None):
                 time.sleep(2.5)
                 if not _entry_listeners_ok(settings):
                     return False, '入口监听校验失败（重启后仍不通）'
+
+            # ── 粘性端口校验 ────────────────────────────────────────
+            #
+            # mihomo 的 SIGHUP 只重读配置，**不释放旧 listener 的 socket**。
+            # 于是同一端口重新出现时 bind 失败（`address already in use`），
+            # 而 SIGHUP 本身返回成功 —— 表现为端口分给了业务、连上去却没人接。
+            #
+            # 唯一可靠的解法是重启进程。但每 acquire 一次就重启会拖垮服务，
+            # 所以这里做**时间窗限流**：20 秒内最多重启一次，且只在确实有
+            # 端口没起来时重启。
+            with STICKY_LOCK:
+                _want = sorted(STICKY_STATE['ports'].keys())
+            if _want and not _sticky_ports_ok(_want):
+                _dead = [p for p in _want if not _sticky_ports_ok([p])]
+                _now = time.time()
+                _can_restart = (_now - STICKY_STATE.get('last_sock_restart', 0)) >= 20
+                if _can_restart:
+                    logger.warning(
+                        f'SIGHUP 后 {len(_dead)}/{len(_want)} 个粘性端口未监听：{_dead}，'
+                        f'重启 mihomo 释放旧 socket')
+                    STICKY_STATE['last_sock_restart'] = _now
+                    c.restart()
+                    time.sleep(3.0)
+                    if not _sticky_ports_ok(_want):
+                        _dead = [p for p in _want if not _sticky_ports_ok([p])]
+                        logger.error(f'重启后仍有粘性端口未监听：{_dead}')
+                else:
+                    logger.warning(
+                        f'{len(_dead)} 个粘性端口未监听 {_dead}，'
+                        f'距上次重启不足 20 秒，跳过重启（避免重启风暴）')
+                with STICKY_LOCK:
+                    for _p in _dead:
+                        _t = STICKY_STATE['ports'].get(_p)
+                        _s = STICKY_STATE['sessions'].get(_t) if _t else None
+                        if _s is not None:
+                            _s['status'] = 'unhealthy'
             return True, None
         except docker.errors.NotFound:
             pass  # 容器不存在 → 走创建分支
@@ -566,9 +635,29 @@ def _sticky_listeners():
     users = _sticky_users()
     out = []
     settings = load_settings()
-    # 场景 F 使用预置静态池：每个池端口固定绑定一个订阅节点，acquire/release 不再改配置
-    if settings.get('scenario') == 'F' and STICKY_STATE['enabled']:
+    # 场景 F 使用预置静态池：每个池端口固定绑定一个订阅节点，acquire/release 不再改配置。
+    #
+    # 判断条件有三个，缺一不可：
+    #   - 全局场景是 F（老路径）
+    #   - 已有 F 会话（多场景并存）
+    #   - **f_pool 非空**（关键）：_acquire_f 先建池再热重载，此刻 F 会话还没
+    #     写进 sessions，只靠 sessions 判断会导致池建好了但 listener 没生成，
+    #     紧接着 _test_through_port 必失败，表现为「F 静态池为空」。
+    if _f_in_use(settings) and STICKY_STATE['enabled']:
+        # ⚠️ 只生成**当前已分配**的 F 端口，不是整个预留池。
+        #
+        # 旧实现把 f_pool 全部 195 个端口都写进 listeners。每来一个 acquire
+        # （不管哪个场景）都会 SIGHUP 重载，mihomo 就要重建 195 个 listener；
+        # 旧 socket 还没释放，新的一批就 bind 失败 → 随机 SSLError。
+        # 195 个端口里实际在用的通常只有个位数，剩下 190+ 个纯属拖累。
+        #
+        # 改法：_acquire_f 先占位（写 STICKY_STATE['ports']）再触发重载，
+        # 所以这里按 ports 过滤，重载时只会生成真正在用的那几个。
+        with STICKY_LOCK:
+            _assigned = set(STICKY_STATE['ports'].keys())
         for e in STICKY_STATE['f_pool']:
+            if e['port'] not in _assigned:
+                continue
             listener = {'name': f"sticky-{e['port']}", 'type': 'socks',
                         'listen': '0.0.0.0', 'port': e['port'], 'proxy': e['ref']}
             if users:
@@ -757,6 +846,44 @@ def _prewarm_f_node_cache():
     logger.info(f'F 节点可用性缓存预热完成：探测 {len(todo)} 个节点')
 
 
+def _has_any_session():
+    """当前是否有任何活跃粘性会话（决定构建配置时能不能「降级」）。"""
+    with STICKY_LOCK:
+        return bool(STICKY_STATE['sessions'])
+
+
+def _f_in_use(settings=None):
+    """F 是否需要参与本次配置构建。
+
+    三种情况都算：
+      1. 全局场景是 F（老路径）
+      2. 已有 F 会话（多场景并存）
+      3. **f_pool 非空**（_acquire_f 先建池、再热重载，此刻会话还没建立）
+
+    第 3 条是关键：少了它，`_build_full_config` 会把刚建好的池清掉，
+    表现为「F 静态池为空」，而日志里明明打印了「池重建 195 个端口」。
+    """
+    settings = settings or load_settings()
+    with STICKY_LOCK:
+        if STICKY_STATE['f_pool']:
+            return True
+        if any(s['scenario'] == 'F' for s in STICKY_STATE['sessions'].values()):
+            return True
+    return settings.get('scenario') == 'F'
+
+
+def _scenario_proxies(scenario, settings):
+    """取某个场景当前配置里的上游节点列表（E 不走这里，它按会话动态提取）。"""
+    if scenario == 'proxy':
+        p = settings.get('saved_scenarios', {}).get('proxy', {})
+        return _proxies_from_lines(p.get('proxies', '').split('\n'),
+                                   p.get('proxy_type', 'socks5'),
+                                   p.get('username', ''), p.get('password', ''))
+    if scenario == 'F':
+        return list(STICKY_STATE['f_nodes'])
+    return []
+
+
 def _rebuild_pool_from_settings(settings=None):
     settings = settings or load_settings()
     p = settings['saved_scenarios'].get('proxy', {})
@@ -781,11 +908,11 @@ def _build_full_config(settings=None):
     """粘性模式完整配置（场景 proxies + 终端/粘性 listeners）"""
     settings = settings or load_settings()
     scenario = settings['scenario']
-    if scenario != 'F' and STICKY_STATE['f_pool']:
-        # 离开场景 F：清空静态池，把端口让回动态分配
-        with STICKY_LOCK:
-            STICKY_STATE['f_pool'] = []
-            STICKY_STATE['f_pool_sig'] = None
+    # 注意：这里**不能**清 f_pool。
+    # 原实现「全局非 F 就清池」在多场景下会误杀：_acquire_f 建好池正要热重载，
+    # 全局还是 E（F 会话尚未写入 sessions），池就被清掉 → 报「F 静态池为空」。
+    # 池的生命周期交给 _ensure_f_pool（按节点签名重建）和维护线程管，
+    # 开关 F 场景时由显式路径清理，不在每次构建配置时顺手清。
     base = {'mode': 'rule', 'allow-lan': True, 'bind-address': '*', 'log-level': 'info', 'ipv6': False}
     proxies = []
     groups = []
@@ -800,7 +927,12 @@ def _build_full_config(settings=None):
         proxies = _proxies_from_lines(p.get('proxies', '').split('\n'), p.get('proxy_type', 'socks5'),
                                       p.get('username', ''), p.get('password', ''))
         if not proxies:
-            return None, '代理列表为空'
+            if _has_any_session():
+                logger.warning('手填代理列表为空，共享口降级为直连（会话不受影响）')
+                base['rules'] = ['MATCH,DIRECT']
+                proxies = []
+            else:
+                return None, '代理列表为空'
         if p.get('rotate', 'yes') == 'yes' and len(proxies) > 1:
             groups.append({'name': 'rotate', 'type': 'load-balance', 'strategy': 'round-robin',
                            'proxies': [x['name'] for x in proxies], 'url': 'http://ip-api.com/json', 'interval': 300})
@@ -834,13 +966,26 @@ def _build_full_config(settings=None):
                                'proxies': ['e_fallback'], 'url': 'http://ip-api.com/json', 'interval': 60})
                 base['rules'] = ['MATCH,rotate']
             else:
-                return None, '场景E无可用节点（API 提取失败），保留现有配置'
+                # 全局 E 提取不出节点只影响共享口 7890/7891。
+                # 有会话在跑时绝不能 return None —— 那会让整份配置构建失败，
+                # 把 E/F/proxy 所有会话一起拖下水。降级成直连即可。
+                _msg = '场景E无可用节点（API 提取失败），共享口已降级为直连'
+                if _has_any_session():
+                    logger.warning(_msg)
+                    base['rules'] = ['MATCH,DIRECT']
+                else:
+                    return None, _msg
     elif scenario == 'F':
         if not STICKY_STATE['f_nodes']:
             _refresh_f_nodes(settings)
         proxies = list(STICKY_STATE['f_nodes'])
         if not proxies:
-            return None, '订阅节点为空'
+            if _has_any_session():
+                logger.warning('订阅节点为空，共享口降级为直连（会话不受影响）')
+                base['rules'] = ['MATCH,DIRECT']
+                proxies = []
+            else:
+                return None, '订阅节点为空'
         groups.append({'name': 'rotate', 'type': 'load-balance', 'strategy': 'round-robin',
                        'proxies': [x['name'] for x in proxies], 'url': 'http://ip-api.com/json', 'interval': 60})
         base['rules'] = ['MATCH,rotate']
@@ -849,7 +994,45 @@ def _build_full_config(settings=None):
     else:
         base['rules'] = ['MATCH,DIRECT']
 
+    # ── 把「所有有活跃会话的场景」的上游并进 proxies ──────────────────
+    #
+    # mihomo 里 listener 的 `proxy: <名字>` 必须能在 proxies 里找到，
+    # 否则整份配置加载失败（不是那一个端口失效，是全部）。
+    # 全局场景只决定共享口 7890/7891 的 rules，不该限制会话能绑什么上游。
+    def _merge_extra(seen, nodes):
+        for n in nodes:
+            if not n or not n.get('name') or n['name'] in seen:
+                continue
+            seen.add(n['name'])
+            proxies.append(n)
+
+    _seen = {p['name'] for p in proxies if p.get('name')}
+    with STICKY_LOCK:
+        _sessions = list(STICKY_STATE['sessions'].values())
+    _active = {s['scenario'] for s in _sessions}
+
+    # E 会话的上游挂在 session.proxy_node 上
+    _merge_extra(_seen, [s.get('proxy_node') for s in _sessions
+                         if s.get('scenario') == 'E'])
+    if 'proxy' in _active:
+        _merge_extra(_seen, _scenario_proxies('proxy', settings))
+    if 'F' in _active or _f_in_use(settings):
+        if not STICKY_STATE['f_nodes']:
+            _refresh_f_nodes(settings)
+        _merge_extra(_seen, list(STICKY_STATE['f_nodes']))
+        # 有 F 会话就必须有静态池，否则 _sticky_listeners 生不出它们的端口
+        if not STICKY_STATE['f_pool']:
+            _ensure_f_pool(settings)
+    # E 的测试节点（测速/切换用）
+    _merge_extra(_seen, list(STICKY_STATE['e_test_nodes']))
+
     base['proxies'] = proxies
+    if not proxies:
+        # 一个上游都没有时别写空 proxies（mihomo 会拒绝），退化成直连
+        base['proxies'] = [{'name': 'direct-dummy', 'type': 'socks5',
+                            'server': '127.0.0.1', 'port': 1}]
+        base['rules'] = ['MATCH,DIRECT']
+        logger.warning('本次配置没有任何可用上游，已退化为 MATCH,DIRECT')
     if groups:
         base['proxy-groups'] = groups
     base['listeners'] = listener_config(settings) + _sticky_listeners()
@@ -1231,7 +1414,20 @@ def _ensure_f_pool(settings=None):
 
 
 # ==================== 会话管理 ====================
-def acquire_session(task_id):
+def acquire_session(task_id, scenario=None):
+    """申请一个粘性会话。
+
+    `scenario` 为 None 时落回全局场景（兼容老调用方）。
+    显式传入时，这个会话就绑定到该场景 —— **不同 session 可以要求不同模式，
+    互不影响**，同一个 mihomo 进程里并存：
+
+        POST /api/session/acquire {"task_id":"a","scenario":"E"}    # 住宅 IP
+        POST /api/session/acquire {"task_id":"b","scenario":"F"}    # 订阅节点
+        POST /api/session/acquire {"task_id":"c","scenario":"proxy"} # 手填代理池
+
+    每个端点拿到独立 listener，`listener.proxy` 直接指向自己那个上游，
+    不经过全局 rules，所以彼此不会串。
+    """
     task_id = (task_id or '').strip()
     if not task_id:
         return None, 'task_id 不能为空'
@@ -1241,17 +1437,26 @@ def acquire_session(task_id):
     with STICKY_LOCK:
         if task_id in STICKY_STATE['sessions']:
             return STICKY_STATE['sessions'][task_id], None
-    scenario = settings['scenario']
-    logger.info(f'acquire 请求 task_id={task_id} scenario={scenario} 池大小={len(STICKY_STATE["pool"])}')
-    if scenario == 'A':
+    # 场景名大小写不敏感地归一化到规范写法（E / F 必须保持大写，
+    # 直接 .lower() 会变成 'e' 从而匹配不上 SESSION_SCENARIOS）
+    _canon = {s.lower(): s for s in SESSION_SCENARIOS}
+    _canon['a'] = 'A'
+    wanted = _canon.get(str(scenario or '').strip().lower())
+    if wanted is None:
+        if not str(scenario or '').strip():
+            wanted = settings['scenario']          # 没传就落回全局
+        else:
+            return None, (f'场景 {scenario} 不支持粘性会话，可选：'
+                          f'{" / ".join(SESSION_SCENARIOS)}')
+    if wanted == 'A':
         return None, '场景A为直连模式，无需粘性会话，请直接使用 7890/7891 端口'
-    if scenario == 'proxy':
+    logger.info(f'acquire 请求 task_id={task_id} scenario={wanted} '
+                f'(全局={settings["scenario"]}) 池大小={len(STICKY_STATE["pool"])}')
+    if wanted == 'proxy':
         return _acquire_bcd(task_id)
-    if scenario == 'E':
+    if wanted == 'E':
         return _acquire_e(task_id)
-    if scenario == 'F':
-        return _acquire_f(task_id)
-    return None, f'场景 {scenario} 暂不支持粘性会话'
+    return _acquire_f(task_id)
 
 
 def _reset_pool_availability():
@@ -1298,7 +1503,7 @@ def _acquire_bcd(task_id):
                 STICKY_STATE['pool'][key]['in_use'] -= 1
             return None, '端口已用尽'
         session = {'task_id': task_id, 'proxy': proxy, 'proxy_key': key, 'ref': ref,
-                   'port': port, 'scenario': settings['scenario'], 'created': time.time(),
+                   'port': port, 'scenario': 'proxy', 'created': time.time(),
                    'expires': None, 'failures': 0, 'status': 'active', 'proxy_node': None}
         _store_session(session)
         attempts += 1
@@ -1491,6 +1696,24 @@ def _f_direct_order(pool, fails):
             + [e for e in pool if e['ref'] != cur])   # 兜底：其它节点
 
 
+def _ensure_f_listener(port, settings=None):
+    """确保某个 F 端口已经在 mihomo 里监听。
+
+    F 的 listener 改成「按需生成」之后，分配完必须立刻重载一次把它挂上。
+    只在端口还没进过配置时做，避免重复重载。
+    """
+    with STICKY_LOCK:
+        if port in STICKY_STATE.get('f_listener_ready', set()):
+            return
+    ok, err = _reload_sticky(settings)
+    if ok:
+        with STICKY_LOCK:
+            STICKY_STATE.setdefault('f_listener_ready', set()).add(port)
+        logger.info(f'F listener 已挂载 port={port}')
+    else:
+        logger.warning(f'F listener 挂载失败 port={port}: {err}')
+
+
 def _acquire_f(task_id):
     """场景 F：注册模式（poll，每任务不同 IP，10分钟过期）/ 正常模式（direct，固定一个可用 IP，不过期）。
 
@@ -1559,6 +1782,7 @@ def _acquire_f(task_id):
         session = _try_acquire(e)
         if session:
             logger.info(f'F 分配成功 task_id={task_id} node={e["ref"]} port={e["port"]} mode={mode}')
+            _ensure_f_listener(session['port'], settings)
             return session, None
     # 候选全部不可用/被占：兜底原子挑选任一空闲池端口（不做可用性校验，保持旧语义）
     with STICKY_LOCK:
@@ -1573,6 +1797,7 @@ def _acquire_f(task_id):
                'expires': time.time() + STICKY_STATE['timeout'] if mode == 'poll' else None,
                'failures': 0, 'status': 'active', 'proxy_node': None}
     _store_session(session)
+    _ensure_f_listener(session['port'], settings)
     logger.info(f'F 兜底复用 task_id={task_id} node={cand["ref"]} port={cand["port"]} mode={mode}')
     return session, None
 
@@ -1584,6 +1809,7 @@ def release_session(task_id):
             return None, '会话不存在'
         STICKY_STATE['ports'].pop(s['port'], None)
         STICKY_STATE['pending'].pop(s['port'], None)
+        STICKY_STATE.setdefault('f_listener_ready', set()).discard(s['port'])
         info = STICKY_STATE['pool'].get(s.get('proxy_key'))
         if info:
             info['in_use'] = max(0, info['in_use'] - 1)
@@ -2000,7 +2226,18 @@ def apply():
         settings['scenario'] = scenario
         save_settings(settings)
         if STICKY_STATE['enabled']:
-            _clear_sessions()
+            # 只清「没有场景标记」的老会话；新会话自带 scenario，
+            # 切全局不该把它们连坐清掉（否则别人正在跑的任务全断）。
+            with STICKY_LOCK:
+                stale = [t for t, s in STICKY_STATE['sessions'].items()
+                         if not s.get('scenario')]
+            for t in stale:
+                release_session(t)
+            if stale:
+                logger.info(f'切场景 {scenario}：清理 {len(stale)} 个无场景标记的老会话')
+            kept = len(STICKY_STATE['sessions'])
+            if kept:
+                logger.info(f'切场景 {scenario}：保留 {kept} 个带场景标记的会话')
             _sync_sticky_from_settings(settings)
             if scenario == 'proxy':
                 _rebuild_pool_from_settings(settings)
@@ -2449,7 +2686,11 @@ def api_session_acquire():
         return api_auth_error()
     data = _json_body()
     task_id = data.get('task_id') or request.form.get('task_id', '')
-    s, err = acquire_session(task_id)
+    # scenario / mode 二选一，留空则用全局场景
+    scenario = (data.get('scenario') or data.get('mode')
+                or request.args.get('scenario')
+                or request.form.get('scenario', ''))
+    s, err = acquire_session(task_id, scenario=scenario or None)
     if s is None:
         return jsonify({'ok': False, 'error': err}), 400
     return jsonify({'ok': True, 'session': _session_public(s)})
@@ -2886,7 +3127,18 @@ def _exec_apply(data):
         settings['scenario'] = scenario
         save_settings(settings)
         if STICKY_STATE['enabled']:
-            _clear_sessions()
+            # 只清「没有场景标记」的老会话；新会话自带 scenario，
+            # 切全局不该把它们连坐清掉（否则别人正在跑的任务全断）。
+            with STICKY_LOCK:
+                stale = [t for t, s in STICKY_STATE['sessions'].items()
+                         if not s.get('scenario')]
+            for t in stale:
+                release_session(t)
+            if stale:
+                logger.info(f'切场景 {scenario}：清理 {len(stale)} 个无场景标记的老会话')
+            kept = len(STICKY_STATE['sessions'])
+            if kept:
+                logger.info(f'切场景 {scenario}：保留 {kept} 个带场景标记的会话')
             _sync_sticky_from_settings(settings)
             if scenario == 'proxy':
                 _rebuild_pool_from_settings(settings)
@@ -3183,8 +3435,10 @@ def api_v1_proxy():
         data = {'ok': True, 'consumed': True, 'session': session_id}
         return (f"ok {session_id}\n" if fmt == 'txt' else jsonify(data))
     if session_id:
-        # 粘性会话：acquire，返回独立端口 listener
-        s, err = acquire_session(session_id)
+        # 粘性会话：acquire 后返回独立端口 listener
+        _sc = (request.args.get('scenario') or kwargs.get('scenario')
+               or request.args.get('mode') or '')
+        s, err = acquire_session(session_id, scenario=_sc or None)
         if s is None:
             if err == '粘性会话模式未开启':
                 return jsonify({'ok': False, 'error': 'STICKY_DISABLED', 'message': err}), 400
