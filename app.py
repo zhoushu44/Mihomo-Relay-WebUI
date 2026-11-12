@@ -532,13 +532,22 @@ def _sticky_ports_ok(expected_ports):
     """
     if not expected_ports:
         return True
+    # ⚠️ 探测目标不能写 127.0.0.1。
+    #
+    # mihomo 跑在 host 网络，mihomo-web 跑在 bridge 网络（mihomo-web_default）。
+    # 在 mihomo-web 里连 127.0.0.1 是自己的 loopback，永远连不上 —— 2026-11-12
+    # 实测这个错误探测导致「明明在监听也判失败」，进而触发重启，
+    # 而重启又打断了正在建的其他 listener，把 24 并发直接搞成全端口不可用。
+    #
+    # 正确目标是宿主侧地址，优先用 MIHOMO_HOST（默认 host.docker.internal）。
     import socket as _socket
+    host = (os.environ.get('MIHOMO_HOST') or 'host.docker.internal').strip()
     for port in expected_ports:
         try:
             sk = _socket.socket()
             try:
                 sk.settimeout(1.5)
-                if sk.connect_ex(('127.0.0.1', int(port))) != 0:
+                if sk.connect_ex((host, int(port))) != 0:
                     return False
             finally:
                 sk.close()
@@ -584,20 +593,28 @@ def _apply_config(config_str, settings=None):
                 _dead = [p for p in _want if not _sticky_ports_ok([p])]
                 _now = time.time()
                 _can_restart = (_now - STICKY_STATE.get('last_sock_restart', 0)) >= 20
-                if _can_restart:
+                # 高并发下 SIGHUP 丢 listener 是常态（内核重载有竞态），
+                # 重启代价极大（会把别人的会话一起打断），所以**先再 SIGHUP 一次**：
+                # 第二轮重载时旧 socket 已经释放，通常就能补齐。
+                if _dead:
                     logger.warning(
                         f'SIGHUP 后 {len(_dead)}/{len(_want)} 个粘性端口未监听：{_dead}，'
-                        f'重启 mihomo 释放旧 socket')
-                    STICKY_STATE['last_sock_restart'] = _now
-                    c.restart()
-                    time.sleep(3.0)
+                        f'补一次重载')
+                    time.sleep(0.5)
+                    c.kill(signal='SIGHUP')
+                    time.sleep(1.5)
                     if not _sticky_ports_ok(_want):
                         _dead = [p for p in _want if not _sticky_ports_ok([p])]
-                        logger.error(f'重启后仍有粘性端口未监听：{_dead}')
-                else:
-                    logger.warning(
-                        f'{len(_dead)} 个粘性端口未监听 {_dead}，'
-                        f'距上次重启不足 20 秒，跳过重启（避免重启风暴）')
+                        logger.warning(f'补重载后仍缺 {len(_dead)} 个：{_dead}')
+                        # 只有连续两轮都补不上，且距上次重启够久，才动重启
+                        if (_now - STICKY_STATE.get('last_sock_restart', 0)) >= 60:
+                            logger.warning('连续两轮 SIGHUP 补不上，重启 mihomo')
+                            STICKY_STATE['last_sock_restart'] = time.time()
+                            c.restart()
+                            time.sleep(3.0)
+                            if not _sticky_ports_ok(_want):
+                                _dead = [p for p in _want if not _sticky_ports_ok([p])]
+                                logger.error(f'重启后仍有 {len(_dead)} 个未监听：{_dead}')
                 with STICKY_LOCK:
                     for _p in _dead:
                         _t = STICKY_STATE['ports'].get(_p)
