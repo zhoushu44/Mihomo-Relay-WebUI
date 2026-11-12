@@ -2140,36 +2140,42 @@ def apply():
     saved = settings.get('saved_scenarios', {})
     msg, ok = '', False
 
-    if is_switch:
-        params = saved.get(scenario, {})
-        if not params and scenario != 'A':
-            msg = '没有已保存的配置，请先保存应用'
-        elif scenario == 'A':
-            params = {'configured': True}
+    if scenario == 'A':
+        params = {'configured': True}
+        saved[scenario] = params
+        settings['saved_scenarios'] = saved
     else:
-        params = {}
+        incoming = {}
         if scenario == 'proxy':
-            params = {
-                'proxy_type': request.form.get('proxy_type', 'socks5'),
+            incoming = {
+                'proxy_type': request.form.get('proxy_type', ''),
                 'proxies': request.form.get('proxies', '').strip(),
                 'username': request.form.get('username', '').strip(),
                 'password': request.form.get('password', '').strip(),
                 'rotate': request.form.get('rotate', 'yes'),
             }
         elif scenario == 'E':
-            params = {
+            incoming = {
                 'api_url': request.form.get('api_url', '').strip(),
                 'api_num': request.form.get('api_num', '1'),
             }
         elif scenario == 'F':
-            params = {
+            # f_mode 没有默认值：不传就不该覆盖已存的 mode。
+            # 原来写 'direct' 兜底，导致切一次 F 就把 poll 改成 direct。
+            incoming = {
                 'clash_url': request.form.get('clash_url', '').strip(),
-                'mode': request.form.get('f_mode', 'direct'),
+                'mode': request.form.get('f_mode', ''),
             }
-        elif scenario == 'A':
-            params = {'configured': True}
-        saved[scenario] = params
-        settings['saved_scenarios'] = saved
+        merged, status = _merge_scenario_params(saved.get(scenario, {}),
+                                                incoming, scenario)
+        if merged is None:
+            msg = (f'场景 {scenario} 缺少必填参数'
+                   f'（{_SCENARIO_KEY_FIELD.get(scenario)}），'
+                   f'已保留原有配置不变')
+        else:
+            params = merged
+            saved[scenario] = params
+            settings['saved_scenarios'] = saved
 
     if not msg:
         if STICKY_STATE['enabled']:
@@ -3026,6 +3032,39 @@ def api_ui_action():
     return jsonify({'ok': ok, 'message': msg, 'status': status})
 
 
+#: 每个场景的「关键字段」——这些字段一旦被空值覆盖，该场景就废了。
+#: proxy 的 proxies / E 的 api_url / F 的 clash_url。
+_SCENARIO_KEY_FIELD = {
+    'proxy': 'proxies',
+    'E': 'api_url',
+    'F': 'clash_url',
+}
+
+
+def _merge_scenario_params(saved_for_scenario, incoming, scenario):
+    """合并场景参数：只收有值的字段，关键字段绝不接受空值。
+
+    2026-11-12 修：原来 `apply()` 会无条件 `saved[scenario] = params`，
+    只提交 `{"scenario":"E"}` 就把 api_url 写成空串，整套 E 模式失效。
+    `_exec_apply()` 非 switch 分支同样会带空值写入。
+    """
+    merged = dict(saved_for_scenario or {})
+    key_field = _SCENARIO_KEY_FIELD.get(scenario)
+    changed = False
+    for k, v in (incoming or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            # 空字符串一律跳过，不用它覆盖已有值
+            continue
+        merged[k] = v
+        changed = True
+    # 关键字段兜底：合并完还是空，说明这次请求什么有效信息都没带
+    if key_field and not str(merged.get(key_field) or '').strip():
+        return None, 'missing_key_field'
+    return merged, ('merged' if changed else 'unchanged')
+
+
 def _exec_apply(data):
     """场景保存/切换核心逻辑，供 UI 与 /api/v1/config 复用。data 为合并后的字段字典。"""
     scenario = data.get('scenario')
@@ -3037,7 +3076,7 @@ def _exec_apply(data):
     req_params = {}
     if scenario == 'proxy':
         req_params = {
-            'proxy_type': data.get('proxy_type', 'socks5'),
+            'proxy_type': data.get('proxy_type', ''),
             'proxies': (data.get('proxies') or '').strip(),
             'username': (data.get('username') or '').strip(),
             'password': (data.get('password') or '').strip(),
@@ -3049,29 +3088,28 @@ def _exec_apply(data):
             'api_num': data.get('api_num', '1'),
         }
     elif scenario == 'F':
+        # 同上：f_mode 不传就留空，由合并器跳过
         req_params = {
             'clash_url': (data.get('clash_url') or '').strip(),
-            'mode': data.get('f_mode', 'direct'),
+            'mode': data.get('f_mode', ''),
         }
-    if is_switch:
-        params = dict(saved.get(scenario, {}))
-        # 请求体携带了有效参数时覆盖已保存配置（API 单次调用即可保存+切换）
-        if req_params:
-            has_value = any(v for k, v in req_params.items()
-                            if k not in ('mode', 'proxy_type', 'rotate', 'api_num'))
-            if has_value or not params:
-                params.update({k: v for k, v in req_params.items() if v != ''})
-        if not params and scenario != 'A':
-            msg = '没有已保存的配置，请先保存应用'
-        elif scenario == 'A':
-            params = {'configured': True}
-    else:
-        params = req_params
-        if scenario == 'A':
-            params = {'configured': True}
-    if params:
+    if scenario == 'A':
+        params = {'configured': True}
         saved[scenario] = params
         settings['saved_scenarios'] = saved
+    else:
+        # 不论 switch 还是保存，都走同一个合并器：
+        # 只接收有值的字段，关键字段（proxies/api_url/clash_url）不接受空值。
+        merged, status = _merge_scenario_params(saved.get(scenario, {}),
+                                                req_params, scenario)
+        if merged is None:
+            msg = (f'场景 {scenario} 缺少必填参数'
+                   f'（{_SCENARIO_KEY_FIELD.get(scenario)}），'
+                   f'已保留原有配置不变')
+        else:
+            params = merged
+            saved[scenario] = params
+            settings['saved_scenarios'] = saved
 
     if not msg:
         if STICKY_STATE['enabled']:
