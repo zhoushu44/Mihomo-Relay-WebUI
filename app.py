@@ -58,6 +58,7 @@ STICKY_STATE = {
     'e_test_nodes': [],      # E 场景测试节点（测速/测试/切换时自动提取，避免显示空）
     'e_extract_cd': 0,       # E 测试节点提取失败冷却截止时间戳
     'e_extract_cd_err': '',  # 冷却期直接返回的失败原因
+    'pending': {},           # port -> 占位时间戳（提取中，尚未转正为会话）
 }
 
 
@@ -573,9 +574,16 @@ def _sticky_listeners():
             if users:
                 listener['users'] = users
             out.append(listener)
+    seen_ports = set()
     for s in STICKY_STATE['sessions'].values():
         if s['scenario'] == 'F':
             continue  # F 会话复用静态池 listener，不额外生成
+        if s['port'] in seen_ports:
+            # 正常路径下端口由 _alloc_port 原子分配，理论不会重复；
+            # 真出现重复说明有脏数据，跳过并告警，别把配置写成两个同名 listener。
+            logger.error(f'粘性端口重复 task_id={s["task_id"]} port={s["port"]}，已跳过')
+            continue
+        seen_ports.add(s['port'])
         listener = {'name': f"sticky-{s['port']}", 'type': 'socks',
                     'listen': '0.0.0.0', 'port': s['port'], 'proxy': s['ref']}
         if users:
@@ -596,21 +604,82 @@ def _sticky_listen_url(port, host=None):
     return f"{scheme}://{auth}{host}:{port}"
 
 
-def _alloc_port():
-    start = STICKY_STATE['port_start']
-    end = STICKY_STATE['port_end']
-    settings = load_settings()
-    used = set(STICKY_STATE['ports'].keys())
-    # F 静态池端口已被占用（池 listener 常驻），避免动态分配时冲突
-    for e in STICKY_STATE['f_pool']:
-        used.add(e['port'])
-    for item in (settings['socks'], settings['http']):
-        if item['enabled']:
-            used.add(int(item['port']))
-    for p in range(start, end + 1):
-        if p not in used:
-            return p
-    return None
+def _alloc_port(reserve_for=None):
+    """原子分配一个粘性端口。
+
+    ⚠️ **必须在锁内完成「查空闲 + 占位」两步**。旧实现只读 `ports` 不写，
+    调用方拿到端口后还要经历「提取上游 → 热重载」几秒钟才 `_store_session`，
+    这段时间里并发 acquire 看到的是同一个空端口 —— 实测 4 并发全部拿到
+    40001，四条上游链路挤在一个 listener 上，出口 IP 变成同一个。
+
+    `reserve_for` 给定时，分配的同时就把 `ports[port]` 写上占位值
+    （`pending:<task_id>`），后续 `_store_session` 会用真正的 task_id 覆盖。
+    """
+    with STICKY_LOCK:
+        start = STICKY_STATE['port_start']
+        end = STICKY_STATE['port_end']
+        used = set(STICKY_STATE['ports'].keys())
+        # F 静态池端口已被占用（池 listener 常驻），避免动态分配时冲突
+        for e in STICKY_STATE['f_pool']:
+            used.add(e['port'])
+        settings = load_settings()
+        for item in (settings['socks'], settings['http']):
+            if item['enabled']:
+                used.add(int(item['port']))
+        for p in range(start, end + 1):
+            if p not in used:
+                if reserve_for is not None:
+                    STICKY_STATE['ports'][p] = reserve_for
+                    STICKY_STATE['pending'][p] = time.time()
+                return p
+        return None
+
+
+def _probe_node_direct(node, timeout=8):
+    """不经 listener，直接拿提取到的上游探活。
+
+    场景 E 的 `test_enabled` 可能被关掉（用户想省时间），但那样会把**已经死掉的
+    上游**直接发给业务：实测 2026-11-11 提取到的第一个节点 `107.151.197.73:22403`
+    已经失效，同批另外 7 个都活，`test_enabled=false` 时死节点照样返回。
+
+    这里用最便宜的一次请求兜底，代价约 1-3 秒。返回 True 才继续。
+    """
+    if not node:
+        return False
+    is_socks = str(node.get('type') or 'http').lower().startswith('socks')
+    auth = ''
+    if node.get('username'):
+        auth = (f"{quote(str(node['username']), safe='')}:"
+                f"{quote(str(node.get('password', '')), safe='')}@")
+    scheme = 'socks5h' if is_socks else 'http'
+    proxy_url = f"{scheme}://{auth}{node['server']}:{node['port']}"
+    # 和 _test_through_port 同一套防呆：test_url 指向内网时必然探不通，
+    # 会把好节点误判成死节点，回退到默认公网探测地址。
+    test_url = STICKY_STATE['test_url'] or 'http://ip-api.com/json'
+    try:
+        _host = test_url.split('://', 1)[-1].split('/', 1)[0].split(':')[0]
+        if _host.startswith(('172.', '10.', '192.168.', '127.', 'localhost')):
+            test_url = 'http://ip-api.com/json'
+    except Exception:
+        test_url = 'http://ip-api.com/json'
+    try:
+        r = subprocess.run(
+            ['curl', '-x', proxy_url, '-sS', '--connect-timeout', '5',
+             '--max-time', str(timeout), '-o', '/dev/null', '-w', '%{http_code}', test_url],
+            capture_output=True, text=True, timeout=timeout + 4)
+        code = r.stdout.strip()
+        if r.returncode != 0 or not code.isdigit():
+            logger.warning(f'节点直探失败 {node["server"]}:{node["port"]} '
+                           f'rc={r.returncode} out={code[:20]} err={r.stderr.strip()[:80]}')
+            return False
+        if not (200 <= int(code) < 400):
+            logger.warning(f'节点直探非 2xx/3xx {node["server"]}:{node["port"]} code={code}')
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f'节点直探异常 {node.get("server")}:{node.get("port")} '
+                       f'{type(exc).__name__}: {str(exc)[:100]}')
+        return False
 
 
 def _test_through_port(port, timeout=8):
@@ -629,9 +698,14 @@ def _test_through_port(port, timeout=8):
             ['curl', '-x', _sticky_listen_url(port), '-sS', '--connect-timeout', '5', '--max-time', str(timeout),
              '-o', '/dev/null', '-w', '%{http_code}', url],
             capture_output=True, text=True, timeout=timeout + 5)
-        # curl 自身成功（returncode==0）且收到任意 HTTP 状态码，即证明代理链路可达；
-        # 404/5xx 等状态码也视为可达（目标服务器响应了），只有连接失败/超时才判定不可用
-        return r.returncode == 0 and r.stdout.strip().isdigit()
+        # 只认 2xx/3xx。旧实现「任何状态码都算可达」，把上游代理返回的
+        # 403 / 407（白名单没加、账密错）也当成健康，于是死节点能一路下发
+        # 到业务侧（2026-11-11 实测：池里 8 个节点 status 全 healthy，
+        # 实际全部 403）。
+        code = r.stdout.strip()
+        if r.returncode != 0 or not code.isdigit():
+            return False
+        return 200 <= int(code) < 400
     except Exception:
         return False
 
@@ -696,6 +770,8 @@ def _rebuild_pool_from_settings(settings=None):
             STICKY_STATE['pool'][key] = {
                 'key': key, 'ref': x['name'], 'proxy': f"{x['server']}:{x['port']}",
                 'in_use': 0, 'failures': 0, 'available': True,
+                # 探活结果：没探过就是 None，别拿 available 冒充 healthy
+                'probed': False, 'last_ok': None, 'last_probe': 0,
             }
         STICKY_STATE['rr'] = 0
     return STICKY_STATE['pool']
@@ -794,6 +870,7 @@ def _store_session(session):
     with STICKY_LOCK:
         STICKY_STATE['sessions'][session['task_id']] = session
         STICKY_STATE['ports'][session['port']] = session['task_id']
+        STICKY_STATE['pending'].pop(session['port'], None)
 
 
 # ==================== 场景 E：API 提取 ====================
@@ -1215,7 +1292,7 @@ def _acquire_bcd(task_id):
             info = STICKY_STATE['pool'][key]
             info['in_use'] += 1
             ref, proxy = info['ref'], info['proxy']
-        port = _alloc_port()
+        port = _alloc_port(reserve_for=f'pending:{task_id}')
         if port is None:
             with STICKY_LOCK:
                 STICKY_STATE['pool'][key]['in_use'] -= 1
@@ -1230,7 +1307,14 @@ def _acquire_bcd(task_id):
             release_session(task_id)
             return None, f'热重载失败：{err}'
         if STICKY_STATE['test_enabled']:
-            if _test_through_port(port):
+            probe_ok = _test_through_port(port)
+            with STICKY_LOCK:
+                entry = STICKY_STATE['pool'].get(key)
+                if entry is not None:
+                    entry['probed'] = True
+                    entry['last_ok'] = probe_ok
+                    entry['last_probe'] = time.time()
+            if probe_ok:
                 logger.info(f'分配成功 task_id={task_id} proxy={proxy} port={port}')
                 return session, None
             with STICKY_LOCK:
@@ -1253,7 +1337,8 @@ def _acquire_e(task_id):
     api_url = f.get('api_url', '').strip()
     if not api_url:
         return None, '请先配置 API URL'
-    port = _alloc_port()
+    # 原子占位：否则并发 acquire 会拿到同一端口（见 _alloc_port 注释）
+    port = _alloc_port(reserve_for=f'pending:{task_id}')
     if port is None:
         return None, '端口已用尽'
     last_err = '提取失败'
@@ -1273,6 +1358,13 @@ def _acquire_e(task_id):
             last_err = 'API 返回格式无法解析'
             continue
         node['name'] = f"e_{port}"
+        # 先直探再用：test_enabled=false 时这里是唯一一道拦截
+        if not _probe_node_direct(node):
+            last_err = f'提取的代理不可用，已重试{attempt+1}次'
+            logger.warning(f'E 提取到不可用节点 task_id={task_id} '
+                           f'proxy={node["server"]}:{node["port"]} 第{attempt+1}次')
+            time.sleep(1)
+            continue
         session = {'task_id': task_id, 'proxy': f"{node['server']}:{node['port']}",
                    'proxy_key': None, 'ref': node['name'], 'port': port,
                    'scenario': 'E', 'created': time.time(),
@@ -1365,6 +1457,7 @@ def _ensure_e_proxy(settings=None, need_speed=False):
 def _free_port(port):
     with STICKY_LOCK:
         STICKY_STATE['ports'].pop(port, None)
+        STICKY_STATE['pending'].pop(port, None)
 
 
 F_DIRECT_MAX_FAIL = 2  # 正常模式固化节点累计失败达到此值即换节点
@@ -1490,6 +1583,7 @@ def release_session(task_id):
         if not s:
             return None, '会话不存在'
         STICKY_STATE['ports'].pop(s['port'], None)
+        STICKY_STATE['pending'].pop(s['port'], None)
         info = STICKY_STATE['pool'].get(s.get('proxy_key'))
         if info:
             info['in_use'] = max(0, info['in_use'] - 1)
@@ -1578,6 +1672,9 @@ def _clear_sessions(reason='场景切换'):
 
 
 # ==================== 后台维护线程 ====================
+PENDING_TTL = 180         # 端口占位最长存活时间（秒）；E 提取最坏 3 次 × 20s 足够
+
+
 def _sticky_cleanup():
     if not STICKY_STATE['enabled']:
         return
@@ -1589,14 +1686,43 @@ def _sticky_cleanup():
         s, _ = release_session(t)
         logger.info(f'过期清理 task_id={t}')
 
+    # 回收僵死占位：_alloc_port 先写 pending 防并发撞端口，正常几秒后就被
+    # _store_session 覆盖。若提取阶段抛异常/进程重启，占位会一直占着端口。
+    with STICKY_LOCK:
+        stale = [(p, ts) for p, ts in STICKY_STATE['pending'].items()
+                 if now - ts > PENDING_TTL and p not in STICKY_STATE['sessions']]
+        for p, ts in stale:
+            STICKY_STATE['pending'].pop(p, None)
+            STICKY_STATE['ports'].pop(p, None)
+    if stale:
+        logger.warning(f'回收僵死端口占位 {len(stale)} 个：{[p for p, _ in stale]}')
+
 
 def _sticky_health_check():
     if not STICKY_STATE['enabled']:
         return
     with STICKY_LOCK:
         snap = [(t, s['port'], s['scenario'], s['ref']) for t, s in STICKY_STATE['sessions'].items()]
+    # E 会话单独并发探：串行 curl 每个最多 13s，会话一多就把维护线程卡死。
+    e_snap = [(t, port, ref) for t, port, scenario, ref in snap if scenario == 'E']
+    if e_snap and STICKY_STATE['test_enabled']:
+        def _probe_e(item):
+            t_, port_, ref_ = item
+            return t_, port_, ref_, _test_through_port(port_)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(e_snap))) as ex:
+            for t_, port_, ref_, ok_ in ex.map(_probe_e, e_snap):
+                with STICKY_LOCK:
+                    cur = STICKY_STATE['sessions'].get(t_)
+                    if cur is not None:
+                        cur['status'] = 'active' if ok_ else 'unhealthy'
+                if not ok_:
+                    logger.warning(f'E 会话健康检查失败 session={t_} proxy={ref_}（按设计不切换）')
+
     for t, port, scenario, ref in snap:
         try:
+            if scenario == 'E':
+                continue  # 上面已并发处理
             if scenario in ('B', 'C', 'D', 'proxy', 'F') and not _test_through_port(port):
                 if scenario == 'F' and STICKY_STATE['f_mode'] != 'direct':
                     continue
@@ -2374,8 +2500,17 @@ def api_pool_status():
         proxies = []
         for k, v in pool.items():
             status = 'busy' if v['in_use'] > 0 else 'available'
-            health = 'unhealthy' if not v['available'] else 'healthy'
-            proxies.append({'proxy': v['proxy'], 'in_use': v['in_use'], 'status': status, 'health': health})
+            if not v['available']:
+                health = 'unhealthy'
+            elif v.get('probed'):
+                health = 'healthy' if v.get('last_ok') else 'unhealthy'
+            else:
+                # 没探过就说 unknown。旧实现只要 available=True 就回 'healthy'，
+                # 实测池里 8 个节点全 403 也照样报 healthy。
+                health = 'unknown'
+            proxies.append({'proxy': v['proxy'], 'in_use': v['in_use'],
+                            'status': status, 'health': health,
+                            'probed_at': v.get('last_probe') or 0})
         available = sum(1 for v in pool.values() if v['available'])
         in_use = sum(v['in_use'] for v in pool.values())
         f_nodes = len(STICKY_STATE['f_nodes'])

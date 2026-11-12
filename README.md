@@ -240,6 +240,39 @@ curl -X DELETE -H 'Content-Type: application/json' \
 - 消耗式提取：consume=1 取走即烧号；手动轮换（sticky-rotate）只换后端、端口不变
 - 会话端口带 SOCKS5 账号密码认证：无凭据/错误凭据一律拒连；端口 URL 仅通过带 Key 的 API 发放
 
+### 并发安全（2026-11-12 修复）
+
+端口分配是**原子**的：`_alloc_port()` 在 `STICKY_LOCK` 内同时完成「查空闲」和「占位」
+（`ports[port] = pending:<task_id>`），占位在 3 分钟内没转正由维护线程回收。
+
+修复前：`_alloc_port()` 只读 `ports` 不写，从「拿到端口」到 `_store_session()` 之间隔着
+一次几秒的 curl 提取，并发 acquire 全拿到 40001，四条上游挤在一个 listener 上，
+出口 IP 变成同一个。实测 4 并发 → `[40001, 40001, 40001, 40001]`。
+
+修复后：8 并发 → `[40001…40008]`，8 个不同出口 IP。回归测试见 `test_sticky_regression.py`。
+
+### 探活判据
+
+`_test_through_port()` **只认 2xx/3xx**。旧版「任何 HTTP 状态码都算可达」，
+把上游返回的 `403`（白名单没加）/`407`（账密错）也当成健康，池子里 8 个节点
+`health` 全 `healthy` 而实际全部 403。
+
+`/api/pool/status` 的 `health` 字段现在有三种值：
+
+| 值 | 含义 |
+|---|---|
+| `unknown` | 从没探过（**不再冒充 healthy**） |
+| `healthy` | 最近一次探活 2xx/3xx |
+| `unhealthy` | 探活失败或被标记不可用 |
+
+### 场景 E 的死节点拦截
+
+E 模式下 `test_enabled` 可以关（省时间），但那样会**直接下发死节点**：
+2026-11-11 实测第一条提取结果 `107.151.197.73:22403` 已失效，同批另外 7 个都活着。
+
+现在不论 `test_enabled` 如何，提取后都会先 `_probe_node_direct()` 直探上游
+（不经 listener，一次 curl，约 1-3 秒），死了就换下一条重试。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -294,6 +327,24 @@ Mihomo-Relay-WebUI/
 - **安全实测**：无 Key 无法获取会话端口（401）、无凭据直连被 SOCKS5 认证拒绝
 - **端口开放**：7890 / 7892 / 40001-40999 外部直连验证通过
 - **代码一致性**：容器内 app.py 与本地 md5 完全一致
+
+## 2026-11-12 修复记录
+
+在 45.205.27.41 实测发现并修掉的 6 个问题，每条都有对应的回归测试（`test_sticky_regression.py`，20 项）：
+
+| # | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | 并发 acquire 全部拿到 40001，出口 IP 相同 | `_alloc_port()` 无锁且只读不占位，到 `_store_session()` 之间有几秒窗口 | 锁内原子「查+占位」，`pending:<task_id>` 占位 + 180s 超时回收 |
+| 2 | 池里节点 `health` 全 `healthy`，实际全 403 | `_test_through_port()` 把任意状态码都当可达 | 只认 2xx/3xx |
+| 3 | `health` 恒为 `healthy`（拿 `available` 冒充） | `/api/pool/status` 没读过探活结果 | 三态 `unknown/healthy/unhealthy`，BCD 探活结果回写池子 |
+| 4 | `test_enabled=false` 时死节点直接下发 | 关掉验活后没有任何兜底 | 新增 `_probe_node_direct()`，提取后必经一次直探 |
+| 5 | E 会话死了仍显示 `active` | 健康巡检只覆盖 B/C/D/F | E 纳入巡检（并发探，按设计不自动切换，只标 `unhealthy`） |
+| 6 | 脏数据可能写出两个同名 listener | `_sticky_listeners()` 不去重 | 端口去重 + 告警 |
+
+**回归测试**：`python -m pytest test_sticky_regression.py -v`
+
+用 HEAD 原版跑这套测试会红 15 项（含 `端口重复：[40001, 40001, 40001, 40001]`），
+修复后 20/20 全绿。
 
 ## 架构与工作原理
 
